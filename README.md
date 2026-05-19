@@ -1,1 +1,1 @@
-"# gltf-physics-export" 
+# gltf-physics-export
