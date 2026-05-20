@@ -26,6 +26,7 @@ in-repo [`gltf-physics-exporter.js`](example/babylonjs/gltf-physics-exporter.js)
 | Filtering | `Filtering.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Filtering/index.html> |
 | Triggers | `Triggers.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Triggers/index.html> |
 | Joint Types | `JointTypes.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/JointTypes/index.html> |
+| Round-trip validation | (all of the above) | <https://cx20.github.io/gltf-physics-export/example/babylonjs/validation.html> |
 
 **Export pipeline.** Each loaded sample now round-trips its full physics
 payload: on load, the exporter fetches the source `.glb`, parses its JSON
@@ -48,8 +49,10 @@ older `mesh.aggregate` path.
    captured extension data as the source of truth.
 4. **Gizmo editing** — interactive transform handles for repositioning
    bodies and joint anchors.
-5. **Round-trip validation** — confirm an exported `.glb` re-imports identical
-   to the edited scene.
+5. **Round-trip validation** — done. The
+   [`validation.html`](example/babylonjs/validation.html) page loads each
+   sample, exports it via `GLTFPhysicsExport`, and diffs the resulting
+   physics extension blocks against the source for semantic equivalence.
 
 ## Repository layout
 

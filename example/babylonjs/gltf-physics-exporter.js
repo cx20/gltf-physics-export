@@ -572,9 +572,130 @@
         setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
     }
 
+    // --- round-trip validation ---
+
+    async function validateRoundTripAsync(scene, sourceGlbUrl) {
+        const sourceResp = await fetch(sourceGlbUrl);
+        if (!sourceResp.ok) {
+            throw new Error('validateRoundTrip: source fetch failed: ' + sourceResp.status);
+        }
+        const sourceJson = parseGLB(await sourceResp.arrayBuffer()).json;
+
+        const outBuffer = await GLBAsync(scene, 'roundtrip-validation', { download: false });
+        const exportedJson = parseGLB(outBuffer).json;
+
+        const sourceNorm = normalizePhysicsJson(sourceJson);
+        const exportedNorm = normalizePhysicsJson(exportedJson);
+
+        const diffs = [];
+        diffArray('shapes', sourceNorm.shapes, exportedNorm.shapes, diffs);
+        diffArray('physicsMaterials', sourceNorm.physicsMaterials, exportedNorm.physicsMaterials, diffs);
+        diffArray('collisionFilters', sourceNorm.collisionFilters, exportedNorm.collisionFilters, diffs);
+        diffArray('physicsJoints', sourceNorm.physicsJoints, exportedNorm.physicsJoints, diffs);
+        diffPerNode(sourceNorm.perNode, exportedNorm.perNode, diffs);
+
+        return { pass: diffs.length === 0, diffs: diffs };
+    }
+
+    function normalizePhysicsJson(json) {
+        const implicit = (json.extensions && json.extensions.KHR_implicit_shapes) || {};
+        const rigid = (json.extensions && json.extensions.KHR_physics_rigid_bodies) || {};
+        const nodes = json.nodes || [];
+        const meshes = json.meshes || [];
+
+        const perNode = new Map();
+        nodes.forEach(function (n) {
+            const ext = n && n.extensions && n.extensions.KHR_physics_rigid_bodies;
+            if (!ext || !n.name) return;
+            const cloned = JSON.parse(JSON.stringify(ext));
+            indexRefsToNames(cloned, nodes, meshes);
+            // Babylon's GLTF2Export drops mesh names but preserves node names,
+            // so meshName diverges between source and export. Drop it and
+            // compare only via the owning-node name, which survives.
+            stripMeshName(cloned.collider && cloned.collider.geometry);
+            stripMeshName(cloned.trigger && cloned.trigger.geometry);
+            perNode.set(n.name, cloned);
+        });
+
+        return {
+            shapes: implicit.shapes || [],
+            physicsMaterials: rigid.physicsMaterials || [],
+            collisionFilters: rigid.collisionFilters || [],
+            physicsJoints: rigid.physicsJoints || [],
+            perNode: perNode
+        };
+    }
+
+    function stripMeshName(geometry) {
+        if (geometry) delete geometry.meshName;
+    }
+
+    function diffArray(label, a, b, diffs) {
+        if (a.length !== b.length) {
+            diffs.push({ path: label, reason: 'length ' + a.length + ' vs ' + b.length });
+            return;
+        }
+        for (let i = 0; i < a.length; i++) {
+            const r = deepDiff(a[i], b[i], '');
+            if (r) diffs.push({ path: label + '[' + i + ']', reason: r });
+        }
+    }
+
+    function diffPerNode(srcMap, expMap, diffs) {
+        const names = new Set();
+        srcMap.forEach(function (_v, k) { names.add(k); });
+        expMap.forEach(function (_v, k) { names.add(k); });
+        names.forEach(function (name) {
+            const s = srcMap.get(name);
+            const e = expMap.get(name);
+            if (!s) { diffs.push({ path: 'nodes["' + name + '"]', reason: 'extra in export' }); return; }
+            if (!e) { diffs.push({ path: 'nodes["' + name + '"]', reason: 'missing in export' }); return; }
+            const r = deepDiff(s, e, '');
+            if (r) diffs.push({ path: 'nodes["' + name + '"]', reason: r });
+        });
+    }
+
+    const FLOAT_EPS = 1e-4;
+
+    function deepDiff(a, b, path) {
+        if (typeof a === 'number' && typeof b === 'number') {
+            if (Math.abs(a - b) > FLOAT_EPS) return path + ': ' + a + ' vs ' + b;
+            return null;
+        }
+        if (a === null || b === null || a === undefined || b === undefined) {
+            if (a !== b) return path + ': ' + JSON.stringify(a) + ' vs ' + JSON.stringify(b);
+            return null;
+        }
+        if (typeof a !== typeof b) {
+            return path + ': ' + typeof a + ' vs ' + typeof b;
+        }
+        if (Array.isArray(a) || Array.isArray(b)) {
+            if (!Array.isArray(a) || !Array.isArray(b)) return path + ': array vs non-array';
+            if (a.length !== b.length) return path + ': array length ' + a.length + ' vs ' + b.length;
+            for (let i = 0; i < a.length; i++) {
+                const r = deepDiff(a[i], b[i], path + '[' + i + ']');
+                if (r) return r;
+            }
+            return null;
+        }
+        if (typeof a === 'object') {
+            const keys = new Set();
+            Object.keys(a).forEach(function (k) { keys.add(k); });
+            Object.keys(b).forEach(function (k) { keys.add(k); });
+            for (const k of keys) {
+                const r = deepDiff(a[k], b[k], path ? path + '.' + k : k);
+                if (r) return r;
+            }
+            return null;
+        }
+        if (a !== b) return path + ': ' + JSON.stringify(a) + ' vs ' + JSON.stringify(b);
+        return null;
+    }
+
     BABYLON.GLTFPhysicsExport = {
         snapshot: snapshot,
         captureLoadedAsync: captureLoadedAsync,
-        GLBAsync: GLBAsync
+        GLBAsync: GLBAsync,
+        validateRoundTripAsync: validateRoundTripAsync
     };
 })(typeof window !== 'undefined' ? window.BABYLON : undefined);
