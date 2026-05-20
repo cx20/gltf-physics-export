@@ -69,7 +69,7 @@ function createScene() {
     dirLight.intensity = 0.6;
 
     const material = new BABYLON.StandardMaterial('material', scene);
-    material.diffuseTexture = new BABYLON.Texture('../../assets/textures/frog.jpg', scene);
+    material.diffuseTexture = new BABYLON.Texture('../../../assets/textures/frog.jpg', scene);
 
     const ground = BABYLON.MeshBuilder.CreateBox('ground', {
         width: 200 * PHYSICS_SCALE, height: 0.1, depth: 200 * PHYSICS_SCALE

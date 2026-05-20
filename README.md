@@ -18,14 +18,14 @@ in-repo [`gltf-physics-exporter.js`](example/babylonjs/gltf-physics-exporter.js)
 
 | Sample | Source `.glb` | Live demo |
 | --- | --- | --- |
-| Minimum scene (programmatic) | — (built in code) | <https://cx20.github.io/gltf-physics-export/example/babylonjs/index.html> |
-| Shape Types | `ShapeTypes.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/ShapeTypes/index.html> |
-| Materials — Friction | `Materials_Friction.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Materials_Friction/index.html> |
-| Materials — Restitution | `Materials_Restitution.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Materials_Restitution/index.html> |
-| Motion Properties | `MotionProperties.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/MotionProperties/index.html> |
-| Filtering | `Filtering.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Filtering/index.html> |
-| Triggers | `Triggers.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Triggers/index.html> |
-| Joint Types | `JointTypes.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/JointTypes/index.html> |
+| Minimum scene (programmatic) | — (built in code) | <https://cx20.github.io/gltf-physics-export/example/babylonjs/minimum/index.html> |
+| Basic Shapes | `ShapeTypes.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_Basic_Shapes/index.html> |
+| Materials — Friction | `Materials_Friction.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_Materials_Friction/index.html> |
+| Materials — Restitution | `Materials_Restitution.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_Materials_Restitution/index.html> |
+| Motion Properties | `MotionProperties.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_Motion_Properties/index.html> |
+| Filtering | `Filtering.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_Filtering/index.html> |
+| Triggers | `Triggers.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_Triggers/index.html> |
+| Joint Types | `JointTypes.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/gltf_physics_JointTypes/index.html> |
 | Round-trip validation | (all of the above) | <https://cx20.github.io/gltf-physics-export/example/babylonjs/validation.html> |
 
 **Export pipeline.** Each loaded sample now round-trips its full physics
@@ -79,16 +79,18 @@ older `mesh.aggregate` path.
 
 ```
 example/babylonjs/
-  index.html, index.js              Minimum scene that drives the exporter
   gltf-physics-exporter.js          Shared exporter module (BABYLON.GLTFPhysicsExport)
-  style.css
-  ShapeTypes/                       Ports of cx20/webgl-physics-examples
-  Filtering/                          (Babylon.js + Havok), one per eoin sample.
-  JointTypes/                         Each page loads the corresponding upstream
-  Materials_Friction/                 .glb and exposes an Export .glb button.
-  Materials_Restitution/
-  MotionProperties/
-  Triggers/
+  control-panel.js                  Shared lil-gui control panel module
+  validation.html, validation.js    Round-trip validation page
+  minimum/                          Programmatic minimum scene that drives the exporter
+    index.html, index.js, style.css
+  gltf_physics_Basic_Shapes/        Ports of cx20/webgl-physics-examples
+  gltf_physics_Filtering/             (Babylon.js + Havok), one per eoin sample.
+  gltf_physics_JointTypes/            Each page loads the corresponding upstream
+  gltf_physics_Materials_Friction/    .glb and exposes an Export .glb button.
+  gltf_physics_Materials_Restitution/
+  gltf_physics_Motion_Properties/
+  gltf_physics_Triggers/
 assets/textures/                    Shared textures used by the samples
 ```
 
