@@ -1,10 +1,20 @@
 // Babylon.js + Havok glTF Physics exporter module.
 // Exposes BABYLON.GLTFPhysicsExport with:
-//   - snapshot(scene)                       capture initial transforms (optional)
-//   - GLBAsync(scene, fileName, options)    export the scene as a .glb with
-//                                           KHR_physics_rigid_bodies + KHR_implicit_shapes
-// Output schema follows eoineoineoin/glTF_Physics_Blender_Exporter so it round-trips
-// through the loader used by the gltf_physics_* samples in this repo.
+//   - snapshot(scene)                              capture initial transforms (optional)
+//   - captureLoadedAsync(scene, glbUrl)            capture KHR_physics_* extensions from a .glb
+//                                                  that has just been appended to the scene, so
+//                                                  the same data can be re-emitted on export.
+//   - GLBAsync(scene, fileName, options)           export the scene as a .glb with
+//                                                  KHR_physics_rigid_bodies + KHR_implicit_shapes
+//
+// Two export paths:
+//   1. Programmatic scenes (Babylon PhysicsAggregate) — shapes + materials are
+//      derived from each mesh's aggregate / boundingInfo.
+//   2. Loaded scenes (captureLoadedAsync was called) — the original
+//      KHR_implicit_shapes / KHR_physics_rigid_bodies blocks are preserved
+//      verbatim. Per-node joint.connectedNode references are resolved to node
+//      names at capture time and remapped to indices at export time so they
+//      survive Babylon's re-numbering.
 
 (function (BABYLON) {
     if (!BABYLON) {
@@ -12,6 +22,7 @@
     }
 
     const SNAPSHOT_KEY = '__gltfPhysicsExportSnapshot';
+    const CAPTURED_KEY = '__gltfPhysicsCaptured';
 
     const GLB_MAGIC = 0x46546C67;  // 'glTF'
     const GLB_VERSION = 2;
@@ -36,15 +47,75 @@
         });
     }
 
+    // --- capture loaded physics ---
+
+    async function captureLoadedAsync(scene, glbUrl) {
+        const response = await fetch(glbUrl);
+        if (!response.ok) {
+            throw new Error('captureLoadedAsync: fetch failed for ' + glbUrl + ': ' + response.status);
+        }
+        const arrayBuffer = await response.arrayBuffer();
+        const { json } = parseGLB(arrayBuffer);
+
+        const implicit = json.extensions && json.extensions.KHR_implicit_shapes;
+        const rigid = json.extensions && json.extensions.KHR_physics_rigid_bodies;
+        const nodes = json.nodes || [];
+        const meshes = json.meshes || [];
+
+        // Per-node physics blocks keyed by node name. Cross-references that
+        // point at other resources by index (joint.connectedNode, and
+        // mesh/node references inside collider/trigger geometry) are stored as
+        // NAMES so the export step can rebind them to whatever indices the
+        // re-serialized glTF assigns.
+        const byName = new Map();
+        nodes.forEach(function (node) {
+            const ext = node && node.extensions && node.extensions.KHR_physics_rigid_bodies;
+            if (!ext || !node.name) {
+                return;
+            }
+            const cloned = JSON.parse(JSON.stringify(ext));
+            indexRefsToNames(cloned, nodes, meshes);
+            byName.set(node.name, cloned);
+        });
+
+        const captured = {
+            shapes: implicit && Array.isArray(implicit.shapes)
+                ? JSON.parse(JSON.stringify(implicit.shapes))
+                : [],
+            physicsMaterials: rigid && Array.isArray(rigid.physicsMaterials)
+                ? JSON.parse(JSON.stringify(rigid.physicsMaterials))
+                : [],
+            collisionFilters: rigid && Array.isArray(rigid.collisionFilters)
+                ? JSON.parse(JSON.stringify(rigid.collisionFilters))
+                : [],
+            physicsJoints: rigid && Array.isArray(rigid.physicsJoints)
+                ? JSON.parse(JSON.stringify(rigid.physicsJoints))
+                : [],
+            byName: byName
+        };
+
+        scene.metadata = scene.metadata || {};
+        scene.metadata[CAPTURED_KEY] = captured;
+        return captured;
+    }
+
+    // --- main export entry ---
+
     async function GLBAsync(scene, baseName, options) {
         options = options || {};
-        const data = collectPhysicsData(scene);
+        const captured = scene.metadata && scene.metadata[CAPTURED_KEY];
+        const derived = captured ? null : collectPhysicsData(scene);
         const restore = applySnapshots(scene);
         try {
             const exportOptions = {
                 shouldExportNode: function (node) {
                     if (options.shouldExportNode && !options.shouldExportNode(node)) {
                         return false;
+                    }
+                    if (captured) {
+                        // Loaded scenes own their lights — keep them so the exported
+                        // .glb stays visually identical.
+                        return true;
                     }
                     return !(node instanceof BABYLON.Light);
                 }
@@ -60,7 +131,11 @@
             const arrayBuffer = await fileMap[glbName].arrayBuffer();
             const { json, bin } = parseGLB(arrayBuffer);
 
-            injectPhysicsExtensions(json, data);
+            if (captured) {
+                injectCapturedExtensions(json, captured);
+            } else {
+                injectPhysicsExtensions(json, derived);
+            }
 
             const outBuffer = buildGLB(json, bin);
             if (options.download !== false) {
@@ -72,7 +147,7 @@
         }
     }
 
-    // --- physics data collection ---
+    // --- physics data collection (programmatic scenes) ---
 
     function collectPhysicsData(scene) {
         const shapes = [];
@@ -233,7 +308,7 @@
         };
     }
 
-    // --- glTF JSON injection ---
+    // --- glTF JSON injection (programmatic scenes) ---
 
     function injectPhysicsExtensions(json, data) {
         const used = new Set(json.extensionsUsed || []);
@@ -256,6 +331,150 @@
             node.extensions = node.extensions || {};
             node.extensions.KHR_physics_rigid_bodies = body;
         });
+    }
+
+    // --- glTF JSON injection (captured / loaded scenes) ---
+
+    function injectCapturedExtensions(json, captured) {
+        const used = new Set(json.extensionsUsed || []);
+        used.add('KHR_implicit_shapes');
+        used.add('KHR_physics_rigid_bodies');
+        json.extensionsUsed = Array.from(used);
+
+        json.extensions = json.extensions || {};
+        json.extensions.KHR_implicit_shapes = {
+            shapes: JSON.parse(JSON.stringify(captured.shapes))
+        };
+
+        const rigid = {};
+        if (captured.physicsMaterials.length) {
+            rigid.physicsMaterials = JSON.parse(JSON.stringify(captured.physicsMaterials));
+        }
+        if (captured.collisionFilters.length) {
+            rigid.collisionFilters = JSON.parse(JSON.stringify(captured.collisionFilters));
+        }
+        if (captured.physicsJoints.length) {
+            rigid.physicsJoints = JSON.parse(JSON.stringify(captured.physicsJoints));
+        }
+        json.extensions.KHR_physics_rigid_bodies = rigid;
+
+        if (!Array.isArray(json.nodes)) {
+            return;
+        }
+
+        // Map name -> new index for nodes and meshes so captured references
+        // can be remapped onto Babylon's renumbered output.
+        const nameToNodeIndex = new Map();
+        json.nodes.forEach(function (node, i) {
+            if (node && node.name) {
+                nameToNodeIndex.set(node.name, i);
+            }
+        });
+        const nameToMeshIndex = new Map();
+        (json.meshes || []).forEach(function (mesh, i) {
+            if (mesh && mesh.name) {
+                nameToMeshIndex.set(mesh.name, i);
+            }
+        });
+
+        json.nodes.forEach(function (node) {
+            if (!node || !node.name) {
+                return;
+            }
+            const block = captured.byName.get(node.name);
+            if (!block) {
+                return;
+            }
+            const cloned = JSON.parse(JSON.stringify(block));
+            namesToIndexRefs(cloned, nameToNodeIndex, nameToMeshIndex, json.nodes);
+            node.extensions = node.extensions || {};
+            node.extensions.KHR_physics_rigid_bodies = cloned;
+        });
+    }
+
+    // Mapping for resource references inside a KHR_physics_rigid_bodies block.
+    // Capture stores names; export resolves them back to whatever indices the
+    // re-serialized glTF assigns (Babylon's GLTF2Export renumbers nodes /
+    // meshes / accessors). This is what keeps the mesh-collision floor in
+    // ShapeTypes pointing at the same Plane mesh after a round-trip instead of
+    // dangling at the original index.
+
+    function indexRefsToNames(block, nodes, meshes) {
+        if (block.joint && typeof block.joint.connectedNode === 'number') {
+            const connected = nodes[block.joint.connectedNode];
+            block.joint.connectedNodeName = connected ? connected.name : null;
+            delete block.joint.connectedNode;
+        }
+        geometryIndexRefsToNames(block.collider && block.collider.geometry, nodes, meshes);
+        geometryIndexRefsToNames(block.trigger && block.trigger.geometry, nodes, meshes);
+    }
+
+    function geometryIndexRefsToNames(geometry, nodes, meshes) {
+        if (!geometry) return;
+        if (typeof geometry.mesh === 'number') {
+            const meshIdx = geometry.mesh;
+            const mesh = meshes[meshIdx];
+            geometry.meshName = mesh ? mesh.name : null;
+            // Babylon's GLTF2Export drops mesh names but preserves node names, so
+            // also stash the name of any node that owns this mesh — at export
+            // time we can look that node up and read its renumbered mesh index.
+            const owner = nodes.find(function (n) { return n && n.mesh === meshIdx; });
+            geometry.meshOwnerNodeName = owner ? owner.name : null;
+            delete geometry.mesh;
+        }
+        if (typeof geometry.node === 'number') {
+            const node = nodes[geometry.node];
+            geometry.nodeName = node ? node.name : null;
+            delete geometry.node;
+        }
+    }
+
+    function namesToIndexRefs(block, nameToNodeIndex, nameToMeshIndex, jsonNodes) {
+        if (block.joint && block.joint.connectedNodeName != null) {
+            const idx = nameToNodeIndex.get(block.joint.connectedNodeName);
+            if (typeof idx === 'number') {
+                block.joint.connectedNode = idx;
+            }
+            delete block.joint.connectedNodeName;
+        }
+        geometryNamesToIndexRefs(block.collider && block.collider.geometry, nameToNodeIndex, nameToMeshIndex, jsonNodes);
+        geometryNamesToIndexRefs(block.trigger && block.trigger.geometry, nameToNodeIndex, nameToMeshIndex, jsonNodes);
+    }
+
+    function geometryNamesToIndexRefs(geometry, nameToNodeIndex, nameToMeshIndex, jsonNodes) {
+        if (!geometry) return;
+        if (geometry.meshName != null || geometry.meshOwnerNodeName != null) {
+            let idx;
+            if (geometry.meshName != null) {
+                idx = nameToMeshIndex.get(geometry.meshName);
+            }
+            if (typeof idx !== 'number' && geometry.meshOwnerNodeName != null) {
+                const ownerIdx = nameToNodeIndex.get(geometry.meshOwnerNodeName);
+                if (typeof ownerIdx === 'number') {
+                    const ownerNode = jsonNodes[ownerIdx];
+                    if (ownerNode && typeof ownerNode.mesh === 'number') {
+                        idx = ownerNode.mesh;
+                    }
+                }
+            }
+            if (typeof idx === 'number') {
+                geometry.mesh = idx;
+            } else {
+                console.warn('[GLTFPhysicsExport] Could not resolve collider mesh ref:',
+                    geometry.meshName, 'owner:', geometry.meshOwnerNodeName);
+            }
+            delete geometry.meshName;
+            delete geometry.meshOwnerNodeName;
+        }
+        if (geometry.nodeName != null) {
+            const idx = nameToNodeIndex.get(geometry.nodeName);
+            if (typeof idx === 'number') {
+                geometry.node = idx;
+            } else {
+                console.warn('[GLTFPhysicsExport] No exported node matches captured name:', geometry.nodeName);
+            }
+            delete geometry.nodeName;
+        }
     }
 
     // --- GLB pack / unpack ---
@@ -355,6 +574,7 @@
 
     BABYLON.GLTFPhysicsExport = {
         snapshot: snapshot,
+        captureLoadedAsync: captureLoadedAsync,
         GLBAsync: GLBAsync
     };
 })(typeof window !== 'undefined' ? window.BABYLON : undefined);
