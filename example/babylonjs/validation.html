@@ -16,6 +16,7 @@
     td.status.pass { color: #1a7f37; }
     td.status.fail { color: #cf222e; }
     td.status.pending { color: #6e7781; font-weight: normal; }
+    tr.section th { background: #e8eef8; font-weight: 600; padding: 6px 12px; }
     pre { margin: 0; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
     #hiddenCanvas { position: absolute; left: -9999px; top: -9999px; width: 1px; height: 1px; }
   </style>
@@ -26,9 +27,11 @@
 </head>
 <body>
   <h1>glTF Physics Round-Trip Validation</h1>
-  <p>For each loaded sample, this page fetches the upstream <code>.glb</code>, runs it through
-     <code>BABYLON.GLTFPhysicsExport</code>, and compares the resulting physics extension blocks
-     against the source for semantic equivalence (<code>KHR_implicit_shapes</code> +
+  <p>For each entry below, this page fetches the upstream source (<code>.glb</code> for the
+     showroom samples, <code>.gltf</code> for the per-feature test suites at
+     <a href="https://github.com/eoineoineoin/glTF_Physics/tree/master/tests">eoineoineoin/glTF_Physics/tests</a>),
+     runs it through <code>BABYLON.GLTFPhysicsExport</code>, and compares the resulting physics
+     extension blocks against the source for semantic equivalence (<code>KHR_implicit_shapes</code> +
      <code>KHR_physics_rigid_bodies</code> only; geometry / materials are out of scope).</p>
   <button id="runBtn" type="button">Run validation</button>
   <canvas id="hiddenCanvas" width="1" height="1"></canvas>
