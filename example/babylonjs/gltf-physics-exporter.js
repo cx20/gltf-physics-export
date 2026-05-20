@@ -59,13 +59,26 @@
 
     // --- capture loaded physics ---
 
-    async function captureLoadedAsync(scene, glbUrl) {
-        const response = await fetch(glbUrl);
+    // Fetch and parse a glTF source. Accepts both binary `.glb` and the
+    // JSON `.gltf` variant (the upstream test suites at
+    // https://github.com/eoineoineoin/glTF_Physics/tree/master/tests ship the
+    // latter alongside `.bin` buffers). We only need the JSON chunk here, so
+    // we never have to materialize the `.bin` payloads — they are pulled in
+    // by Babylon's SceneLoader independently.
+    async function fetchSourceJson(url) {
+        const response = await fetch(url);
         if (!response.ok) {
-            throw new Error('captureLoadedAsync: fetch failed for ' + glbUrl + ': ' + response.status);
+            throw new Error('fetch failed for ' + url + ': ' + response.status);
+        }
+        if (/\.gltf(\?.*)?$/i.test(url)) {
+            return await response.json();
         }
         const arrayBuffer = await response.arrayBuffer();
-        const { json } = parseGLB(arrayBuffer);
+        return parseGLB(arrayBuffer).json;
+    }
+
+    async function captureLoadedAsync(scene, sourceUrl) {
+        const json = await fetchSourceJson(sourceUrl);
 
         const implicit = json.extensions && json.extensions.KHR_implicit_shapes;
         const rigid = json.extensions && json.extensions.KHR_physics_rigid_bodies;
@@ -817,12 +830,8 @@
 
     // --- round-trip validation ---
 
-    async function validateRoundTripAsync(scene, sourceGlbUrl) {
-        const sourceResp = await fetch(sourceGlbUrl);
-        if (!sourceResp.ok) {
-            throw new Error('validateRoundTrip: source fetch failed: ' + sourceResp.status);
-        }
-        const sourceJson = parseGLB(await sourceResp.arrayBuffer()).json;
+    async function validateRoundTripAsync(scene, sourceUrl) {
+        const sourceJson = await fetchSourceJson(sourceUrl);
 
         const outBuffer = await GLBAsync(scene, 'roundtrip-validation', { download: false });
         const exportedJson = parseGLB(outBuffer).json;
