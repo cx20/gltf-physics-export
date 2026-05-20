@@ -63,8 +63,10 @@
         });
 
         addResetButton(gui, scene);
+        addWireframeToggle(gui, scene);
         addMaterialFolders(gui, scene, captured);
         addMassFolder(gui, scene, captured);
+        addExportButton(gui, scene, options);
         return gui;
     }
 
@@ -77,6 +79,66 @@
             }
         };
         gui.add(actions, 'reset').name('Reset positions');
+    }
+
+    function addWireframeToggle(gui, scene) {
+        if (!BABYLON.Debug || !BABYLON.Debug.PhysicsViewer) return;
+        let viewer = null;
+        let observer = null;
+        const state = { wireframe: false };
+        const enable = function () {
+            viewer = new BABYLON.Debug.PhysicsViewer(scene);
+            const seen = new WeakSet();
+            const showAll = function () {
+                const visit = function (node) {
+                    if (!node) return;
+                    const body = node.physicsBody;
+                    if (body && !seen.has(body) && viewer.showBody) {
+                        viewer.showBody(body);
+                        seen.add(body);
+                    }
+                };
+                (scene.meshes || []).forEach(visit);
+                (scene.transformNodes || []).forEach(visit);
+            };
+            showAll();
+            observer = scene.onBeforeRenderObservable.add(showAll);
+        };
+        const disable = function () {
+            if (observer) {
+                scene.onBeforeRenderObservable.remove(observer);
+                observer = null;
+            }
+            if (viewer) {
+                try { viewer.dispose(); } catch (_err) { /* best effort */ }
+                viewer = null;
+            }
+        };
+        gui.add(state, 'wireframe').name('Wireframe').onChange(function (v) {
+            if (v) enable(); else disable();
+        });
+    }
+
+    function addExportButton(gui, scene, options) {
+        const exportName = options && options.exportName;
+        if (!exportName) return;
+        const state = { status: '' };
+        const statusCtrl = gui.add(state, 'status').name('Status').disable();
+        const actions = {
+            export: async function () {
+                state.status = 'Exporting...';
+                statusCtrl.updateDisplay();
+                try {
+                    await BABYLON.GLTFPhysicsExport.GLBAsync(scene, exportName);
+                    state.status = 'Exported ' + exportName + '.glb';
+                } catch (err) {
+                    console.error(err);
+                    state.status = 'Export failed: ' + err.message;
+                }
+                statusCtrl.updateDisplay();
+            }
+        };
+        gui.add(actions, 'export').name('Export .glb');
     }
 
     function addMaterialFolders(gui, scene, captured) {
