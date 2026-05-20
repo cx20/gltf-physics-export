@@ -10,6 +10,11 @@
 //
 // Joint / filter / trigger / shape-geometry editing is intentionally out of
 // scope for Phase 1.
+//
+// Programmatic scenes (no captureLoadedAsync) still get the always-relevant
+// controls: Reset positions, Wireframe, and Export .glb. The per-body /
+// per-material folders are simply omitted because there's no captured
+// payload to drive them from.
 
 (function (BABYLON) {
     if (!BABYLON) {
@@ -48,10 +53,6 @@
     function init(scene, options) {
         options = options || {};
         const captured = scene.metadata && scene.metadata[CAPTURED_KEY];
-        if (!captured) {
-            console.warn('[GLTFPhysicsControlPanel] captureLoadedAsync must run first');
-            return null;
-        }
         const GUICtor = getGUIConstructor();
         if (!GUICtor) {
             console.warn('[GLTFPhysicsControlPanel] lil-gui not loaded');
@@ -64,9 +65,15 @@
         });
 
         addResetButton(gui, scene);
+        addPausePhysicsToggle(gui, scene);
         addWireframeToggle(gui, scene);
-        addMaterialFolders(gui, scene, captured);
-        addBodiesFolder(gui, scene, captured);
+        if (captured && options.showCaptured !== false) {
+            addMaterialFolders(gui, scene, captured);
+            addBodiesFolder(gui, scene, captured);
+        }
+        if (typeof options.setupExtras === 'function') {
+            options.setupExtras(gui, scene);
+        }
         addExportButton(gui, scene, options);
         return gui;
     }
@@ -80,6 +87,30 @@
             }
         };
         gui.add(actions, 'reset').name('Reset positions');
+    }
+
+    function addPausePhysicsToggle(gui, scene) {
+        // Stop the per-frame physics step at the scene hook so the toggle is
+        // independent of which physics plugin is in use. setTimeStep(0) does
+        // not pause the Havok plugin because Babylon passes the real frame
+        // delta to executeStep regardless of the configured time step;
+        // intercepting Scene._advancePhysicsEngineStep prevents that delta
+        // from reaching the plugin at all. While paused, mass / friction /
+        // geometry edits and full scene rebuilds stay visually frozen so the
+        // user can reposition bodies before resuming.
+        const state = { paused: false };
+        let originalAdvance = null;
+        gui.add(state, 'paused').name('Pause physics').onChange(function (v) {
+            if (v) {
+                if (originalAdvance == null) {
+                    originalAdvance = scene._advancePhysicsEngineStep;
+                }
+                scene._advancePhysicsEngineStep = function () { /* paused */ };
+            } else if (originalAdvance != null) {
+                scene._advancePhysicsEngineStep = originalAdvance;
+                originalAdvance = null;
+            }
+        });
     }
 
     function addWireframeToggle(gui, scene) {
