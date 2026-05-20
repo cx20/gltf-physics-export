@@ -44,9 +44,26 @@ older `mesh.aggregate` path.
 1. **Loader coverage** — done.
 2. **Export from loaded scenes** — done in this PR (`KHR_physics_rigid_bodies`
    + `KHR_implicit_shapes` round-trip end-to-end, including joints).
-3. **Control panel UI** — edit mass, friction, restitution, motion type,
-   joint parameters, filter groups, trigger flags at runtime, with the
-   captured extension data as the source of truth.
+3. **Control panel UI** — in progress. A lil-gui panel
+   ([`control-panel.js`](example/babylonjs/control-panel.js)) is wired into
+   every sample page. Edits write back to the captured extension data so
+   they survive export, and are applied live to the running Havok body.
+   Coverage so far:
+
+   | Parameter | Source field | Status |
+   | --- | --- | --- |
+   | Body mass | `motion.mass` | ✅ slider, live |
+   | Material friction (static = dynamic) | `physicsMaterials[i].staticFriction` / `dynamicFriction` | ✅ slider, live |
+   | Material restitution | `physicsMaterials[i].restitution` | ✅ slider, live |
+   | Reset positions | snapshot taken at load | ✅ button |
+   | Motion type (static/kinematic/dynamic) | `motion.type` | ⏳ not yet |
+   | Inertia / center of mass | `motion.inertiaDiagonal` etc. | ⏳ not yet |
+   | Linear / angular velocity | `motion.linearVelocity` / `angularVelocity` | ⏳ not yet |
+   | Gravity factor | `motion.gravityFactor` | ⏳ not yet |
+   | Collision filter groups / masks | `collider.collisionFilter` | ⏳ not yet |
+   | Trigger flags | `trigger.*` | ⏳ not yet |
+   | Joint parameters (limits, drives) | `physicsJoints[i].*` | ⏳ not yet |
+   | Shape geometry (sphere radius, box size, …) | `shapes[i].*` | ⏳ not yet |
 4. **Gizmo editing** — interactive transform handles for repositioning
    bodies and joint anchors.
 5. **Round-trip validation** — done. The

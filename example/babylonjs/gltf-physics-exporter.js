@@ -33,16 +33,26 @@
         return !!(mesh && (mesh.physicsBody || mesh.aggregate));
     }
 
-    function snapshot(scene) {
-        scene.meshes.forEach(function (mesh) {
-            if (!isPhysicsMesh(mesh)) {
-                return;
+    function forEachPhysicsNode(scene, fn) {
+        const seen = new Set();
+        const visit = function (n) {
+            if (!n || seen.has(n)) return;
+            if (n.physicsBody || n.aggregate) {
+                seen.add(n);
+                fn(n);
             }
-            mesh.metadata = mesh.metadata || {};
-            mesh.metadata[SNAPSHOT_KEY] = {
-                position: mesh.position.clone(),
-                rotation: mesh.rotation.clone(),
-                rotationQuaternion: mesh.rotationQuaternion ? mesh.rotationQuaternion.clone() : null
+        };
+        (scene.meshes || []).forEach(visit);
+        (scene.transformNodes || []).forEach(visit);
+    }
+
+    function snapshot(scene) {
+        forEachPhysicsNode(scene, function (node) {
+            node.metadata = node.metadata || {};
+            node.metadata[SNAPSHOT_KEY] = {
+                position: node.position.clone(),
+                rotation: node.rotation ? node.rotation.clone() : null,
+                rotationQuaternion: node.rotationQuaternion ? node.rotationQuaternion.clone() : null
             };
         });
     }
@@ -272,38 +282,68 @@
 
     // --- snapshot apply / restore ---
 
+    function reset(scene) {
+        const zero = BABYLON.Vector3.Zero();
+        forEachPhysicsNode(scene, function (node) {
+            const snap = node.metadata && node.metadata[SNAPSHOT_KEY];
+            if (!snap) return;
+            const body = node.physicsBody;
+            const hadDisablePreStep = body ? body.disablePreStep : null;
+            if (body) {
+                body.disablePreStep = false;
+            }
+            node.position.copyFrom(snap.position);
+            if (snap.rotationQuaternion) {
+                node.rotationQuaternion = snap.rotationQuaternion.clone();
+            } else if (snap.rotation) {
+                node.rotationQuaternion = null;
+                node.rotation.copyFrom(snap.rotation);
+            }
+            if (node.computeWorldMatrix) node.computeWorldMatrix(true);
+            if (body) {
+                try {
+                    if (typeof body.setLinearVelocity === 'function') body.setLinearVelocity(zero);
+                    if (typeof body.setAngularVelocity === 'function') body.setAngularVelocity(zero);
+                } catch (err) {
+                    console.warn('[GLTFPhysicsExport] reset velocity failed for', node.name, err);
+                }
+                scene.onAfterRenderObservable.addOnce(function () {
+                    body.disablePreStep = hadDisablePreStep == null ? true : hadDisablePreStep;
+                });
+            }
+        });
+    }
+
     function applySnapshots(scene) {
         const restore = [];
-        scene.meshes.forEach(function (mesh) {
-            if (!mesh || !mesh.metadata || !mesh.metadata[SNAPSHOT_KEY]) {
-                return;
-            }
-            const snap = mesh.metadata[SNAPSHOT_KEY];
+        forEachPhysicsNode(scene, function (node) {
+            const snap = node.metadata && node.metadata[SNAPSHOT_KEY];
+            if (!snap) return;
             restore.push({
-                mesh,
-                position: mesh.position.clone(),
-                rotation: mesh.rotation.clone(),
-                rotationQuaternion: mesh.rotationQuaternion ? mesh.rotationQuaternion.clone() : null
+                node: node,
+                position: node.position.clone(),
+                rotation: node.rotation ? node.rotation.clone() : null,
+                rotationQuaternion: node.rotationQuaternion ? node.rotationQuaternion.clone() : null
             });
-            mesh.position.copyFrom(snap.position);
+            node.position.copyFrom(snap.position);
             if (snap.rotationQuaternion) {
-                mesh.rotationQuaternion = snap.rotationQuaternion.clone();
-            } else {
-                mesh.rotationQuaternion = null;
-                mesh.rotation.copyFrom(snap.rotation);
+                node.rotationQuaternion = snap.rotationQuaternion.clone();
+            } else if (snap.rotation) {
+                node.rotationQuaternion = null;
+                node.rotation.copyFrom(snap.rotation);
             }
-            mesh.computeWorldMatrix(true);
+            if (node.computeWorldMatrix) node.computeWorldMatrix(true);
         });
         return function () {
             restore.forEach(function (r) {
-                r.mesh.position.copyFrom(r.position);
+                r.node.position.copyFrom(r.position);
                 if (r.rotationQuaternion) {
-                    r.mesh.rotationQuaternion = r.rotationQuaternion;
-                } else {
-                    r.mesh.rotationQuaternion = null;
-                    r.mesh.rotation.copyFrom(r.rotation);
+                    r.node.rotationQuaternion = r.rotationQuaternion;
+                } else if (r.rotation) {
+                    r.node.rotationQuaternion = null;
+                    r.node.rotation.copyFrom(r.rotation);
                 }
-                r.mesh.computeWorldMatrix(true);
+                if (r.node.computeWorldMatrix) r.node.computeWorldMatrix(true);
             });
         };
     }
@@ -694,6 +734,7 @@
 
     BABYLON.GLTFPhysicsExport = {
         snapshot: snapshot,
+        reset: reset,
         captureLoadedAsync: captureLoadedAsync,
         GLBAsync: GLBAsync,
         validateRoundTripAsync: validateRoundTripAsync
