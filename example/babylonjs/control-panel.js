@@ -5,10 +5,11 @@
 // Each edit writes back to the captured data (so the next export reflects
 // the change) and also applies to the live Babylon physics body for
 // immediate visual feedback. Currently exposes:
-//   - per-body  motion.mass
+//   - per-body  motion.{type, mass, gravityFactor, linearVelocity, angularVelocity}
 //   - per-material  friction (static = dynamic), restitution
 //
-// Joint / filter / trigger editing is intentionally out of scope for now.
+// Joint / filter / trigger / shape-geometry editing is intentionally out of
+// scope for Phase 1.
 
 (function (BABYLON) {
     if (!BABYLON) {
@@ -65,7 +66,7 @@
         addResetButton(gui, scene);
         addWireframeToggle(gui, scene);
         addMaterialFolders(gui, scene, captured);
-        addMassFolder(gui, scene, captured);
+        addBodiesFolder(gui, scene, captured);
         addExportButton(gui, scene, options);
         return gui;
     }
@@ -163,22 +164,108 @@
         });
     }
 
-    function addMassFolder(gui, scene, captured) {
+    function addBodiesFolder(gui, scene, captured) {
         const entries = [];
         captured.byName.forEach(function (block, name) {
-            if (block.motion && typeof block.motion.mass === 'number') {
-                entries.push({ name: name, block: block });
-            }
+            // Surface every node that carries a rigid-body extension, even
+            // static colliders — the type dropdown lets the user promote them
+            // to dynamic / kinematic.
+            entries.push({ name: name, block: block });
         });
         if (!entries.length) return;
-        const folder = gui.addFolder('Mass');
+        const root = gui.addFolder('Bodies');
+        root.close();
         entries.forEach(function (entry) {
-            const proxy = { mass: entry.block.motion.mass };
-            folder.add(proxy, 'mass', 0, 50, 0.1).name(entry.name).onChange(function (v) {
-                entry.block.motion.mass = v;
-                applyMassLive(scene, entry.name, v);
+            const bodyFolder = root.addFolder(entry.name);
+            bodyFolder.close();
+            addMotionFolder(bodyFolder, scene, entry);
+        });
+    }
+
+    function addMotionFolder(parent, scene, entry) {
+        const block = entry.block;
+        const folder = parent.addFolder('Motion');
+        folder.close();
+
+        const proxy = {
+            type: motionTypeOf(block),
+            mass: block.motion && typeof block.motion.mass === 'number' ? block.motion.mass : 1,
+            gravityFactor: block.motion && typeof block.motion.gravityFactor === 'number' ? block.motion.gravityFactor : 1
+        };
+        const linVel = readVec3(block.motion && block.motion.linearVelocity);
+        const angVel = readVec3(block.motion && block.motion.angularVelocity);
+
+        folder.add(proxy, 'type', ['static', 'kinematic', 'dynamic']).onChange(function (v) {
+            applyMotionTypeWrite(block, v, proxy);
+            applyMotionTypeLive(scene, entry.name, v);
+        });
+        folder.add(proxy, 'mass', 0, 50, 0.1).onChange(function (v) {
+            ensureMotion(block);
+            block.motion.mass = v;
+            applyMassLive(scene, entry.name, v);
+        });
+        folder.add(proxy, 'gravityFactor', -2, 2, 0.05).onChange(function (v) {
+            ensureMotion(block);
+            block.motion.gravityFactor = v;
+            applyGravityFactorLive(scene, entry.name, v);
+        });
+
+        const lv = folder.addFolder('Linear velocity');
+        lv.close();
+        ['x', 'y', 'z'].forEach(function (axis, i) {
+            lv.add(linVel, axis, -20, 20, 0.1).onChange(function () {
+                ensureMotion(block);
+                block.motion.linearVelocity = [linVel.x, linVel.y, linVel.z];
+                applyLinearVelocityLive(scene, entry.name, linVel);
             });
         });
+
+        const av = folder.addFolder('Angular velocity');
+        av.close();
+        ['x', 'y', 'z'].forEach(function (axis, i) {
+            av.add(angVel, axis, -20, 20, 0.1).onChange(function () {
+                ensureMotion(block);
+                block.motion.angularVelocity = [angVel.x, angVel.y, angVel.z];
+                applyAngularVelocityLive(scene, entry.name, angVel);
+            });
+        });
+    }
+
+    function motionTypeOf(block) {
+        if (!block.motion) return 'static';
+        if (block.motion.isKinematic === true) return 'kinematic';
+        return 'dynamic';
+    }
+
+    function ensureMotion(block) {
+        if (!block.motion) {
+            block.motion = { mass: 1 };
+        }
+        return block.motion;
+    }
+
+    function applyMotionTypeWrite(block, type, proxy) {
+        if (type === 'static') {
+            delete block.motion;
+            return;
+        }
+        const motion = ensureMotion(block);
+        if (type === 'kinematic') {
+            motion.isKinematic = true;
+        } else {
+            delete motion.isKinematic;
+        }
+        // Re-sync proxy.mass since 'static' may have cleared the motion block
+        // and the dropdown could bounce back; keep the panel internally
+        // consistent.
+        if (typeof motion.mass !== 'number') motion.mass = proxy.mass || 1;
+    }
+
+    function readVec3(arr) {
+        if (Array.isArray(arr) && arr.length === 3) {
+            return { x: arr[0] || 0, y: arr[1] || 0, z: arr[2] || 0 };
+        }
+        return { x: 0, y: 0, z: 0 };
     }
 
     function pickFriction(mat) {
@@ -206,6 +293,52 @@
             target.physicsBody.setMassProperties({ mass: mass });
         } catch (err) {
             console.warn('[GLTFPhysicsControlPanel] setMassProperties failed for', nodeName, err);
+        }
+    }
+
+    function applyMotionTypeLive(scene, nodeName, type) {
+        const target = findPhysicsCarrier(scene, nodeName);
+        if (!target || !target.physicsBody) return;
+        const PMT = BABYLON.PhysicsMotionType;
+        if (!PMT) return;
+        // Babylon names: STATIC, ANIMATED (kinematic), DYNAMIC.
+        const map = { static: PMT.STATIC, kinematic: PMT.ANIMATED, dynamic: PMT.DYNAMIC };
+        const mt = map[type];
+        if (mt == null) return;
+        try {
+            target.physicsBody.setMotionType(mt);
+        } catch (err) {
+            console.warn('[GLTFPhysicsControlPanel] setMotionType failed for', nodeName, err);
+        }
+    }
+
+    function applyGravityFactorLive(scene, nodeName, factor) {
+        const target = findPhysicsCarrier(scene, nodeName);
+        if (!target || !target.physicsBody) return;
+        try {
+            target.physicsBody.setGravityFactor(factor);
+        } catch (err) {
+            console.warn('[GLTFPhysicsControlPanel] setGravityFactor failed for', nodeName, err);
+        }
+    }
+
+    function applyLinearVelocityLive(scene, nodeName, v) {
+        const target = findPhysicsCarrier(scene, nodeName);
+        if (!target || !target.physicsBody) return;
+        try {
+            target.physicsBody.setLinearVelocity(new BABYLON.Vector3(v.x, v.y, v.z));
+        } catch (err) {
+            console.warn('[GLTFPhysicsControlPanel] setLinearVelocity failed for', nodeName, err);
+        }
+    }
+
+    function applyAngularVelocityLive(scene, nodeName, v) {
+        const target = findPhysicsCarrier(scene, nodeName);
+        if (!target || !target.physicsBody) return;
+        try {
+            target.physicsBody.setAngularVelocity(new BABYLON.Vector3(v.x, v.y, v.z));
+        } catch (err) {
+            console.warn('[GLTFPhysicsControlPanel] setAngularVelocity failed for', nodeName, err);
         }
     }
 
