@@ -1,14 +1,43 @@
 // Demo scene driving gltf-physics-exporter.js.
-// Floor (static) + falling cube (dynamic). Click "Export .glb" to download a
-// .glb with KHR_physics_rigid_bodies + KHR_implicit_shapes; the file
-// round-trips through the loader used by the gltf_physics_* samples here.
+// Floor (static) + falling cube (dynamic). The Export .glb button is
+// provided by the shared control panel (control-panel.js); the same panel
+// exposes Scene/Ground and Scene/Cube folders so every value that drives
+// the programmatic setup can be tweaked live and re-exported.
 
 const HAVOK_WASM_URL = 'https://cx20.github.io/gltf-test/libs/babylonjs/dev/HavokPhysics.wasm';
-const PHYSICS_SCALE = 1 / 10;
+
+const params = {
+    ground: {
+        width: 20,
+        height: 0.1,
+        depth: 20,
+        posY: -2,
+        friction: 0.1,
+        restitution: 0.1
+    },
+    cube: {
+        size: 5,
+        posX: 0,
+        posY: 10,
+        posZ: 0,
+        rotX: 10,  // degrees
+        rotY: 0,
+        rotZ: 10,
+        mass: 1,
+        friction: 0.2,
+        restitution: 0.5
+    }
+};
+
+const INITIAL_PARAMS = JSON.parse(JSON.stringify(params));
 
 let engine;
 let scene;
 let canvas;
+let material;
+let ground = null;
+let cube = null;
+const sceneControllers = [];
 
 async function init() {
     canvas = document.querySelector('#c');
@@ -23,28 +52,22 @@ async function init() {
     engine = new BABYLON.Engine(canvas, true);
     scene = createScene();
 
-    // Capture initial pose before physics moves anything, so a later Export
-    // ships the scene's initial setup instead of the cube's mid-fall state.
-    BABYLON.GLTFPhysicsExport.snapshot(scene);
+    refreshCaptured();
+
+    if (BABYLON.GLTFPhysicsControlPanel) {
+        BABYLON.GLTFPhysicsControlPanel.init(scene, {
+            exportName: 'minimum_physics',
+            showCaptured: false,
+            setupExtras: setupSceneFolder
+        });
+    }
 
     engine.runRenderLoop(function () {
         scene.render();
     });
 
-    const exportBtn = document.getElementById('exportBtn');
-    const status = document.getElementById('status');
-    exportBtn.addEventListener('click', async function () {
-        exportBtn.disabled = true;
-        status.textContent = 'Exporting...';
-        try {
-            await BABYLON.GLTFPhysicsExport.GLBAsync(scene, 'minimum_physics');
-            status.textContent = 'Exported minimum_physics.glb';
-        } catch (err) {
-            console.error(err);
-            status.textContent = 'Export failed: ' + err.message;
-        } finally {
-            exportBtn.disabled = false;
-        }
+    window.addEventListener('resize', function () {
+        engine.resize();
     });
 }
 
@@ -57,7 +80,7 @@ function createScene() {
     scene.getPhysicsEngine().setTimeStep(scene.getAnimationRatio());
 
     const camera = new BABYLON.ArcRotateCamera('Camera', 0, 0, 10, new BABYLON.Vector3(0, 0, 0), scene);
-    camera.setPosition(new BABYLON.Vector3(0, 20 * PHYSICS_SCALE, -200 * PHYSICS_SCALE));
+    camera.setPosition(new BABYLON.Vector3(0, 2, -20));
     camera.attachControl(canvas, true);
 
     // Lights are only added for the preview canvas — the loader side supplies its own
@@ -68,32 +91,109 @@ function createScene() {
     dirLight.position = new BABYLON.Vector3(12, 16, 10);
     dirLight.intensity = 0.6;
 
-    const material = new BABYLON.StandardMaterial('material', scene);
+    material = new BABYLON.StandardMaterial('material', scene);
     material.diffuseTexture = new BABYLON.Texture('../../../assets/textures/frog.jpg', scene);
 
-    const ground = BABYLON.MeshBuilder.CreateBox('ground', {
-        width: 200 * PHYSICS_SCALE, height: 0.1, depth: 200 * PHYSICS_SCALE
-    }, scene);
-    ground.material = material;
-    ground.position.y = -20 * PHYSICS_SCALE;
-    ground.aggregate = new BABYLON.PhysicsAggregate(
-        ground, BABYLON.PhysicsShapeType.BOX,
-        { mass: 0, friction: 0.1, restitution: 0.1 }, scene);
-
-    const cube = BABYLON.MeshBuilder.CreateBox('cube', { size: 50 * PHYSICS_SCALE }, scene);
-    cube.material = material;
-    cube.position.y = 100 * PHYSICS_SCALE;
-    cube.rotation.x = Math.PI * 10 / 180;
-    cube.rotation.z = Math.PI * 10 / 180;
-    cube.aggregate = new BABYLON.PhysicsAggregate(
-        cube, BABYLON.PhysicsShapeType.BOX,
-        { mass: 1, friction: 0.2, restitution: 0.5 }, scene);
+    rebuildGround();
+    rebuildCube();
 
     scene.registerBeforeRender(function () {
         scene.activeCamera.alpha += Math.PI * 1.0 / 180.0 * scene.getAnimationRatio();
     });
 
     return scene;
+}
+
+function rebuildGround() {
+    if (ground) {
+        if (ground.aggregate) {
+            try { ground.aggregate.dispose(); } catch (_e) { /* best effort */ }
+            ground.aggregate = null;
+        }
+        ground.dispose();
+    }
+    ground = BABYLON.MeshBuilder.CreateBox('ground', {
+        width: params.ground.width,
+        height: params.ground.height,
+        depth: params.ground.depth
+    }, scene);
+    ground.material = material;
+    ground.position.y = params.ground.posY;
+    ground.aggregate = new BABYLON.PhysicsAggregate(
+        ground, BABYLON.PhysicsShapeType.BOX,
+        { mass: 0, friction: params.ground.friction, restitution: params.ground.restitution }, scene);
+}
+
+function rebuildCube() {
+    if (cube) {
+        if (cube.aggregate) {
+            try { cube.aggregate.dispose(); } catch (_e) { /* best effort */ }
+            cube.aggregate = null;
+        }
+        cube.dispose();
+    }
+    cube = BABYLON.MeshBuilder.CreateBox('cube', { size: params.cube.size }, scene);
+    cube.material = material;
+    cube.position.x = params.cube.posX;
+    cube.position.y = params.cube.posY;
+    cube.position.z = params.cube.posZ;
+    cube.rotation.x = params.cube.rotX * Math.PI / 180;
+    cube.rotation.y = params.cube.rotY * Math.PI / 180;
+    cube.rotation.z = params.cube.rotZ * Math.PI / 180;
+    cube.aggregate = new BABYLON.PhysicsAggregate(
+        cube, BABYLON.PhysicsShapeType.BOX,
+        { mass: params.cube.mass, friction: params.cube.friction, restitution: params.cube.restitution }, scene);
+}
+
+function refreshCaptured() {
+    // Reset positions reads this snapshot; export reads the captured payload.
+    // Both must be refreshed after every rebuild so they reflect the params.
+    BABYLON.GLTFPhysicsExport.snapshot(scene);
+    BABYLON.GLTFPhysicsExport.captureProgrammatic(scene);
+}
+
+function onGroundChanged() {
+    rebuildGround();
+    refreshCaptured();
+}
+
+function onCubeChanged() {
+    rebuildCube();
+    refreshCaptured();
+}
+
+function resetSceneParams() {
+    Object.assign(params.ground, INITIAL_PARAMS.ground);
+    Object.assign(params.cube, INITIAL_PARAMS.cube);
+    rebuildGround();
+    rebuildCube();
+    refreshCaptured();
+    sceneControllers.forEach(function (c) { c.updateDisplay(); });
+}
+
+function setupSceneFolder(gui) {
+    const root = gui.addFolder('Scene');
+    root.add({ reset: resetSceneParams }, 'reset').name('Reset parameters');
+
+    const g = root.addFolder('Ground');
+    sceneControllers.push(g.add(params.ground, 'width', 1, 50, 0.1).onFinishChange(onGroundChanged));
+    sceneControllers.push(g.add(params.ground, 'height', 0.05, 5, 0.05).onFinishChange(onGroundChanged));
+    sceneControllers.push(g.add(params.ground, 'depth', 1, 50, 0.1).onFinishChange(onGroundChanged));
+    sceneControllers.push(g.add(params.ground, 'posY', -10, 5, 0.1).onFinishChange(onGroundChanged));
+    sceneControllers.push(g.add(params.ground, 'friction', 0, 2, 0.01).onFinishChange(onGroundChanged));
+    sceneControllers.push(g.add(params.ground, 'restitution', 0, 1, 0.01).onFinishChange(onGroundChanged));
+
+    const c = root.addFolder('Cube');
+    sceneControllers.push(c.add(params.cube, 'size', 0.5, 20, 0.1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'posX', -10, 10, 0.1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'posY', 1, 30, 0.1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'posZ', -10, 10, 0.1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'rotX', -180, 180, 1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'rotY', -180, 180, 1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'rotZ', -180, 180, 1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'mass', 0, 50, 0.1).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'friction', 0, 2, 0.01).onFinishChange(onCubeChanged));
+    sceneControllers.push(c.add(params.cube, 'restitution', 0, 1, 0.01).onFinishChange(onCubeChanged));
 }
 
 init();

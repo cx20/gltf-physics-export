@@ -109,6 +109,31 @@
         return captured;
     }
 
+    // --- capture programmatic (PhysicsAggregate) scenes ---
+    //
+    // Synthesize a captured-shaped payload from a scene that was built with
+    // PhysicsAggregate (no upstream .glb to capture from). With this in
+    // place the control panel renders its Materials / Bodies folders for
+    // programmatic scenes too, and edits round-trip through the export.
+
+    function captureProgrammatic(scene) {
+        const data = collectPhysicsData(scene);
+        const byName = new Map();
+        data.bodies.forEach(function (block, name) {
+            byName.set(name, JSON.parse(JSON.stringify(block)));
+        });
+        const captured = {
+            shapes: data.shapes,
+            physicsMaterials: data.materials,
+            collisionFilters: [],
+            physicsJoints: [],
+            byName: byName
+        };
+        scene.metadata = scene.metadata || {};
+        scene.metadata[CAPTURED_KEY] = captured;
+        return captured;
+    }
+
     // --- main export entry ---
 
     async function GLBAsync(scene, baseName, options) {
@@ -736,6 +761,7 @@
         snapshot: snapshot,
         reset: reset,
         captureLoadedAsync: captureLoadedAsync,
+        captureProgrammatic: captureProgrammatic,
         GLBAsync: GLBAsync,
         validateRoundTripAsync: validateRoundTripAsync
     };
