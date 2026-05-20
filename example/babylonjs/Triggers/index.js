@@ -135,6 +135,9 @@ async function createScene() {
 
     await BABYLON.SceneLoader.AppendAsync(MODEL_ROOT, MODEL_FILE, scene);
     await BABYLON.GLTFPhysicsExport.captureLoadedAsync(scene, MODEL_ROOT + MODEL_FILE);
+    if (BABYLON.GLTFPhysicsControlPanel) {
+        BABYLON.GLTFPhysicsControlPanel.init(scene);
+    }
 
     const allMeshes = scene.meshes.filter(function (mesh) {
         return mesh && mesh.name !== '__root__' && mesh.getTotalVertices && mesh.getTotalVertices() > 0;
