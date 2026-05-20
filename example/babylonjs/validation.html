@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>glTF Physics Round-Trip Validation</title>
+  <style>
+    body { background: #fff; font: 14px sans-serif; margin: 0; padding: 16px 24px; color: #222; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { margin: 0 0 12px; max-width: 820px; line-height: 1.45; }
+    #runBtn { padding: 8px 14px; border: 1px solid #888; background: #f7f7f7; color: #222; font: 14px sans-serif; cursor: pointer; border-radius: 4px; margin: 8px 0 16px; }
+    #runBtn:hover { background: #eaeaea; }
+    #runBtn:disabled { opacity: 0.6; cursor: default; }
+    table { border-collapse: collapse; width: 100%; max-width: 1000px; }
+    th, td { border: 1px solid #d0d0d0; padding: 8px 12px; text-align: left; vertical-align: top; }
+    th { background: #f3f3f3; font-weight: 600; }
+    td.status { font-weight: 600; white-space: nowrap; }
+    td.status.pass { color: #1a7f37; }
+    td.status.fail { color: #cf222e; }
+    td.status.pending { color: #6e7781; font-weight: normal; }
+    pre { margin: 0; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+    #hiddenCanvas { position: absolute; left: -9999px; top: -9999px; width: 1px; height: 1px; }
+  </style>
+  <script src="https://cx20.github.io/gltf-test/libs/babylonjs/dev/babylon.js"></script>
+  <script src="https://cx20.github.io/gltf-test/libs/babylonjs/dev/babylonjs.loaders.js"></script>
+  <script src="https://cx20.github.io/gltf-test/libs/babylonjs/dev/HavokPhysics_umd.js"></script>
+  <script src="https://cx20.github.io/gltf-test/libs/babylonjs/dev/babylonjs.serializers.js"></script>
+</head>
+<body>
+  <h1>glTF Physics Round-Trip Validation</h1>
+  <p>For each loaded sample, this page fetches the upstream <code>.glb</code>, runs it through
+     <code>BABYLON.GLTFPhysicsExport</code>, and compares the resulting physics extension blocks
+     against the source for semantic equivalence (<code>KHR_implicit_shapes</code> +
+     <code>KHR_physics_rigid_bodies</code> only; geometry / materials are out of scope).</p>
+  <button id="runBtn" type="button">Run validation</button>
+  <canvas id="hiddenCanvas" width="1" height="1"></canvas>
+  <table id="results">
+    <thead><tr><th>Sample</th><th>Status</th><th>Details</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <script src="gltf-physics-exporter.js"></script>
+  <script src="validation.js"></script>
+</body>
+</html>
