@@ -56,14 +56,18 @@ older `mesh.aggregate` path.
    | Material friction (static = dynamic) | `physicsMaterials[i].staticFriction` / `dynamicFriction` | ✅ slider, live |
    | Material restitution | `physicsMaterials[i].restitution` | ✅ slider, live |
    | Reset positions | snapshot taken at load | ✅ button |
-   | Motion type (static/kinematic/dynamic) | `motion.type` | ⏳ not yet |
+   | Motion type (static/kinematic/dynamic) | presence of `motion` + `motion.isKinematic` | ✅ dropdown, live |
+   | Gravity factor | `motion.gravityFactor` | ✅ slider, live |
+   | Linear / angular velocity | `motion.linearVelocity` / `angularVelocity` | ✅ XYZ sliders, live |
    | Inertia / center of mass | `motion.inertiaDiagonal` etc. | ⏳ not yet |
-   | Linear / angular velocity | `motion.linearVelocity` / `angularVelocity` | ⏳ not yet |
-   | Gravity factor | `motion.gravityFactor` | ⏳ not yet |
    | Collision filter groups / masks | `collider.collisionFilter` | ⏳ not yet |
    | Trigger flags | `trigger.*` | ⏳ not yet |
    | Joint parameters (limits, drives) | `physicsJoints[i].*` | ⏳ not yet |
    | Shape geometry (sphere radius, box size, …) | `shapes[i].*` | ⏳ not yet |
+
+   The body-scoped parameters (mass / motion type / gravity / velocity) are
+   grouped under `Bodies/<node name>/Motion` in the panel; materials remain
+   under a top-level `Materials` folder.
 4. **Gizmo editing** — interactive transform handles for repositioning
    bodies and joint anchors.
 5. **Round-trip validation** — done. The
