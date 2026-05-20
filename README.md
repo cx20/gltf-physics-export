@@ -27,21 +27,25 @@ in-repo [`gltf-physics-exporter.js`](example/babylonjs/gltf-physics-exporter.js)
 | Triggers | `Triggers.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/Triggers/index.html> |
 | Joint Types | `JointTypes.glb` | <https://cx20.github.io/gltf-physics-export/example/babylonjs/JointTypes/index.html> |
 
-> ⚠️ **Status of export for loaded samples:** the **Export .glb** button is
-> wired up on every page, but the current exporter only inspects scenes built
-> programmatically through `BABYLON.PhysicsAggregate` (the "Minimum scene"
-> case). When invoked on a loaded sample it still produces a valid `.glb`, but
-> the `KHR_physics_rigid_bodies` / `KHR_implicit_shapes` blocks come out empty.
-> Teaching the exporter to read physics data back from `mesh.physicsBody`
-> (and from the rigid-body loader's metadata) is the focus of the next PR.
+**Export pipeline.** Each loaded sample now round-trips its full physics
+payload: on load, the exporter fetches the source `.glb`, parses its JSON
+chunk, and stashes the original `KHR_implicit_shapes` and
+`KHR_physics_rigid_bodies` blocks (shapes, materials, collision filters,
+joints, and every per-node body / collider / trigger / joint entry) under
+`scene.metadata`. On export, Babylon's `GLTF2Export` writes the geometry
+and the exporter re-injects the captured extensions into the resulting
+`.glb`, remapping joint references through node names so they survive
+Babylon's node renumbering. The programmatic minimum scene still uses the
+older `mesh.aggregate` path.
 
 ## Roadmap
 
-1. **Loader coverage** — done in this PR for the seven samples listed above.
-2. **Export from loaded scenes** — extend the exporter to round-trip
-   `KHR_physics_rigid_bodies` / `KHR_implicit_shapes` data from `physicsBody`.
+1. **Loader coverage** — done.
+2. **Export from loaded scenes** — done in this PR (`KHR_physics_rigid_bodies`
+   + `KHR_implicit_shapes` round-trip end-to-end, including joints).
 3. **Control panel UI** — edit mass, friction, restitution, motion type,
-   joint parameters, filter groups, trigger flags at runtime.
+   joint parameters, filter groups, trigger flags at runtime, with the
+   captured extension data as the source of truth.
 4. **Gizmo editing** — interactive transform handles for repositioning
    bodies and joint anchors.
 5. **Round-trip validation** — confirm an exported `.glb` re-imports identical
