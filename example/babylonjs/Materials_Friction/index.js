@@ -41,33 +41,6 @@ function registerPhysicsExtensions() {
 
     physicsExtensionsRegistered = true;
 }
-function setupPhysicsDebugWireframe(scene) {
-    if (!BABYLON.Debug || !BABYLON.Debug.PhysicsViewer) {
-        return;
-    }
-
-    const physicsViewer = new BABYLON.Debug.PhysicsViewer(scene);
-    const seenImpostors = new WeakSet();
-    const seenBodies = new WeakSet();
-
-    scene.registerBeforeRender(function () {
-        scene.meshes.forEach(function (mesh) {
-            if (!mesh) {
-                return;
-            }
-
-            if (mesh.physicsImpostor && !seenImpostors.has(mesh.physicsImpostor) && physicsViewer.showImpostor) {
-                physicsViewer.showImpostor(mesh.physicsImpostor, mesh);
-                seenImpostors.add(mesh.physicsImpostor);
-            }
-
-            if (mesh.physicsBody && !seenBodies.has(mesh.physicsBody) && physicsViewer.showBody) {
-                physicsViewer.showBody(mesh.physicsBody);
-                seenBodies.add(mesh.physicsBody);
-            }
-        });
-    });
-}
 async function init() {
     canvas = document.querySelector('#c');
     globalThis.HK = await HavokPhysics({
@@ -93,23 +66,6 @@ async function init() {
     window.addEventListener('resize', function () {
         engine.resize();
     });
-
-    const exportBtn = document.getElementById('exportBtn');
-    const status = document.getElementById('status');
-    const exportName = MODEL_FILE.replace(/\.glb$/i, '');
-    exportBtn.addEventListener('click', async function () {
-        exportBtn.disabled = true;
-        status.textContent = 'Exporting...';
-        try {
-            await BABYLON.GLTFPhysicsExport.GLBAsync(scene, exportName);
-            status.textContent = 'Exported ' + exportName + '.glb';
-        } catch (err) {
-            console.error(err);
-            status.textContent = 'Export failed: ' + err.message;
-        } finally {
-            exportBtn.disabled = false;
-        }
-    });
 }
 
 async function createScene() {
@@ -118,7 +74,6 @@ async function createScene() {
 
     const hk = new BABYLON.HavokPlugin();
     scene.enablePhysics(new BABYLON.Vector3(0, -9.8, 0), hk);
-    setupPhysicsDebugWireframe(scene);
     const camera = new BABYLON.ArcRotateCamera('camera', Math.PI / 3, Math.PI / 3, 15, new BABYLON.Vector3(0, 0, 0), scene);
     camera.attachControl(canvas, true);
     camera.wheelDeltaPercentage = 0.005;
@@ -135,7 +90,7 @@ async function createScene() {
     await BABYLON.SceneLoader.AppendAsync(MODEL_ROOT, MODEL_FILE, scene);
     await BABYLON.GLTFPhysicsExport.captureLoadedAsync(scene, MODEL_ROOT + MODEL_FILE);
     if (BABYLON.GLTFPhysicsControlPanel) {
-        BABYLON.GLTFPhysicsControlPanel.init(scene);
+        BABYLON.GLTFPhysicsControlPanel.init(scene, { exportName: MODEL_FILE.replace(/\.glb$/i, '') });
     }
 
     const allMeshes = scene.meshes.filter(function (mesh) {
