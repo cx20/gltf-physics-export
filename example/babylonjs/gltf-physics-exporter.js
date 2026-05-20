@@ -125,13 +125,150 @@
         const captured = {
             shapes: data.shapes,
             physicsMaterials: data.materials,
-            collisionFilters: [],
+            collisionFilters: data.collisionFilters || [],
             physicsJoints: [],
             byName: byName
         };
         scene.metadata = scene.metadata || {};
         scene.metadata[CAPTURED_KEY] = captured;
         return captured;
+    }
+
+    // --- programmatic joint capture (anchor-node form) ---
+    //
+    // glTF Physics joints describe the connection through two attachment
+    // frames, each defined by a node's transform. Babylon's HingeConstraint
+    // and Physics6DoFConstraint carry the pivot points internally — there is
+    // no equivalent pivot offset in the glTF spec. To bridge that, this
+    // builds a pair of TransformNode anchors per constraint (one parented
+    // to each body, positioned at that body's pivot) and writes the joint
+    // entry onto the first anchor. The result matches the form the upstream
+    // JointTypes.glb samples use (`jointSpaceA` / `jointSpaceB`), so the
+    // existing rigid-body loader picks the constraints back up at load
+    // time.
+    //
+    // pendingPhysicsJoints entries (set by sample code via
+    // scene.metadata.__pendingPhysicsJoints) have the shape:
+    //   { meshA, meshB, type: 'hinge' | '6dof',
+    //     pivotA: Vector3, pivotB: Vector3,    // in each body's local space
+    //     limits?: [...]                        // for '6dof', the Babylon API limits
+    //     enableCollision?: boolean }
+    //
+    // Returns a bundle the caller passes to disposeProgrammaticJoints() to
+    // undo the captured-state mutation and dispose the anchors.
+
+    const ANCHOR_PREFIX = '__jointAnchor_';
+
+    function captureProgrammaticJoints(scene) {
+        const pending = scene.metadata && scene.metadata.__pendingPhysicsJoints;
+        if (!Array.isArray(pending) || pending.length === 0) return null;
+        const captured = scene.metadata && scene.metadata[CAPTURED_KEY];
+        if (!captured) {
+            console.warn('[GLTFPhysicsExport] captureProgrammaticJoints: call captureProgrammatic first');
+            return null;
+        }
+
+        const anchors = [];
+        const addedNames = [];
+        const startJointIdx = captured.physicsJoints.length;
+
+        pending.forEach(function (j, idx) {
+            if (!j || !j.meshA || !j.meshB) return;
+
+            const anchorAName = ANCHOR_PREFIX + idx + '_A';
+            const anchorBName = ANCHOR_PREFIX + idx + '_B';
+            // Use a tiny invisible mesh rather than a bare TransformNode so
+            // GLTF2Export reliably emits the node (some versions skip empty
+            // TransformNodes), giving the rigid-body loader something to
+            // resolve joint.connectedNode against on load.
+            const anchorA = BABYLON.MeshBuilder.CreateBox(anchorAName, { size: 0.001 }, scene);
+            anchorA.isVisible = false;
+            anchorA.parent = j.meshA;
+            if (j.pivotA) anchorA.position.copyFrom(j.pivotA);
+            const anchorB = BABYLON.MeshBuilder.CreateBox(anchorBName, { size: 0.001 }, scene);
+            anchorB.isVisible = false;
+            anchorB.parent = j.meshB;
+            if (j.pivotB) anchorB.position.copyFrom(j.pivotB);
+
+            const limits = describeJointLimits(j);
+            const jointIdx = captured.physicsJoints.length;
+            captured.physicsJoints.push({ limits: limits });
+
+            captured.byName.set(anchorAName, {
+                joint: {
+                    connectedNodeName: anchorBName,
+                    joint: jointIdx,
+                    enableCollision: !!j.enableCollision
+                }
+            });
+
+            anchors.push(anchorA, anchorB);
+            addedNames.push(anchorAName);
+        });
+
+        return {
+            anchors: anchors,
+            addedNames: addedNames,
+            startJointIdx: startJointIdx
+        };
+    }
+
+    function disposeProgrammaticJoints(scene, bundle) {
+        if (!bundle) return;
+        const captured = scene.metadata && scene.metadata[CAPTURED_KEY];
+        if (captured) {
+            bundle.addedNames.forEach(function (n) { captured.byName.delete(n); });
+            // Trim the joints we appended so a re-export does not stack them.
+            captured.physicsJoints.length = bundle.startJointIdx;
+        }
+        bundle.anchors.forEach(function (a) {
+            try { a.dispose(); } catch (_e) { /* best effort */ }
+        });
+    }
+
+    function describeJointLimits(j) {
+        if (j.type === 'hinge') {
+            // Lock all linear axes plus angular X and Y; leave angular Z free
+            // so the joint behaves as a hinge around the anchor's local Z
+            // axis. The robot constructs every hinge with axisA/axisB =
+            // (0, 0, 1), so the body-local Z and the anchor-local Z coincide.
+            return [
+                { linearAxes: [0], min: 0, max: 0 },
+                { linearAxes: [1], min: 0, max: 0 },
+                { linearAxes: [2], min: 0, max: 0 },
+                { angularAxes: [0], min: 0, max: 0 },
+                { angularAxes: [1], min: 0, max: 0 }
+            ];
+        }
+        if (j.type === '6dof') {
+            const limits = (j.limits || []).map(function (lim) {
+                const out = limitAxisToGltf(lim.axis);
+                out.min = typeof lim.minLimit === 'number' ? lim.minLimit : 0;
+                out.max = typeof lim.maxLimit === 'number' ? lim.maxLimit : 0;
+                return out;
+            });
+            return limits;
+        }
+        return [];
+    }
+
+    function limitAxisToGltf(axis) {
+        // BABYLON.PhysicsConstraintAxis enum (Babylon 6+):
+        //   LINEAR_X=0, LINEAR_Y=1, LINEAR_Z=2,
+        //   ANGULAR_X=3, ANGULAR_Y=4, ANGULAR_Z=5,
+        //   LINEAR_DISTANCE=6
+        switch (axis) {
+            case 0: return { linearAxes: [0] };
+            case 1: return { linearAxes: [1] };
+            case 2: return { linearAxes: [2] };
+            case 3: return { angularAxes: [0] };
+            case 4: return { angularAxes: [1] };
+            case 5: return { angularAxes: [2] };
+            case 6: return { linearAxes: [0, 1, 2] };
+            default:
+                console.warn('[GLTFPhysicsExport] unknown PhysicsConstraintAxis:', axis);
+                return { linearAxes: [0] };
+        }
     }
 
     // --- main export entry ---
@@ -187,22 +324,23 @@
     function collectPhysicsData(scene) {
         const shapes = [];
         const materials = [];
+        const collisionFilters = [];
         const bodies = new Map(); // mesh name -> node-level KHR_physics_rigid_bodies block
 
         scene.meshes.forEach(function (mesh) {
             if (!isPhysicsMesh(mesh)) {
                 return;
             }
-            const body = describeBody(mesh, shapes, materials);
+            const body = describeBody(mesh, shapes, materials, collisionFilters);
             if (body) {
                 bodies.set(mesh.name, body);
             }
         });
 
-        return { shapes, materials, bodies };
+        return { shapes, materials, collisionFilters, bodies };
     }
 
-    function describeBody(mesh, shapes, materials) {
+    function describeBody(mesh, shapes, materials, collisionFilters) {
         const shapeSpec = describeShape(mesh);
         if (!shapeSpec) {
             console.warn('[GLTFPhysicsExport] Skipping mesh with unsupported physics shape:', mesh.name);
@@ -214,12 +352,52 @@
         const body = {
             collider: { geometry: { shape: shapeIndex }, physicsMaterial: matIndex }
         };
+        const filterSpec = describeCollisionFilter(mesh);
+        if (filterSpec) {
+            body.collider.collisionFilter = pushUnique(collisionFilters, filterSpec);
+        }
         const mass = readMass(mesh);
         if (mass > 0) {
             body.motion = { mass: mass };
         }
         // mass === 0 → static, no motion block (matches the eoineoineoin convention)
         return body;
+    }
+
+    // Babylon stores collision filters as 32-bit bitmasks on the physics
+    // shape. The glTF Physics extension expresses them as named "collision
+    // systems" (string layer names) collected in a top-level
+    // collisionFilters[] array. Encode each set bit as "System_<bit>" so the
+    // exported filters round-trip through the rigid-body loader, which
+    // remaps the same names back to bitmasks at load time.
+    function describeCollisionFilter(mesh) {
+        const shape = mesh.aggregate && mesh.aggregate.shape;
+        if (!shape) return null;
+        const membership = shape.filterMembershipMask;
+        const collide = shape.filterCollideMask;
+        const DEFAULT_ALL = 0xFFFFFFFF;
+        const membershipDefault = membership == null || membership === DEFAULT_ALL;
+        const collideDefault = collide == null || collide === DEFAULT_ALL;
+        if (membershipDefault && collideDefault) return null;
+        const filter = {};
+        if (!membershipDefault) {
+            filter.collisionSystems = bitmaskToSystemNames(membership);
+        }
+        if (!collideDefault) {
+            filter.collideWithSystems = bitmaskToSystemNames(collide);
+        }
+        return filter;
+    }
+
+    function bitmaskToSystemNames(mask) {
+        const names = [];
+        if (mask == null) return names;
+        for (let i = 0; i < 32; i++) {
+            if ((mask & (1 << i)) !== 0) {
+                names.push('System_' + i);
+            }
+        }
+        return names;
     }
 
     function describeShape(mesh) {
@@ -762,6 +940,8 @@
         reset: reset,
         captureLoadedAsync: captureLoadedAsync,
         captureProgrammatic: captureProgrammatic,
+        captureProgrammaticJoints: captureProgrammaticJoints,
+        disposeProgrammaticJoints: disposeProgrammaticJoints,
         GLBAsync: GLBAsync,
         validateRoundTripAsync: validateRoundTripAsync
     };

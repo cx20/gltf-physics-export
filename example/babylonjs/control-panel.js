@@ -160,12 +160,27 @@
             export: async function () {
                 state.status = 'Exporting...';
                 statusCtrl.updateDisplay();
+                // beforeExport lets a sample pause simulation, swap out
+                // wireframe materials, etc., before the serializer runs;
+                // it returns a cleanup function called in finally.
+                let cleanup = null;
+                if (typeof options.beforeExport === 'function') {
+                    try {
+                        cleanup = options.beforeExport(scene);
+                    } catch (err) {
+                        console.warn('[GLTFPhysicsControlPanel] beforeExport threw', err);
+                    }
+                }
                 try {
-                    await BABYLON.GLTFPhysicsExport.GLBAsync(scene, exportName);
+                    await BABYLON.GLTFPhysicsExport.GLBAsync(scene, exportName, options.exportOptions);
                     state.status = 'Exported ' + exportName + '.glb';
                 } catch (err) {
                     console.error(err);
                     state.status = 'Export failed: ' + err.message;
+                } finally {
+                    if (typeof cleanup === 'function') {
+                        try { cleanup(); } catch (e) { console.warn('[GLTFPhysicsControlPanel] beforeExport cleanup threw', e); }
+                    }
                 }
                 statusCtrl.updateDisplay();
             }
