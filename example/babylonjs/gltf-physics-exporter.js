@@ -85,12 +85,24 @@
         const nodes = json.nodes || [];
         const meshes = json.meshes || [];
 
-        // Per-node physics blocks keyed by node name. Cross-references that
-        // point at other resources by index (joint.connectedNode, and
-        // mesh/node references inside collider/trigger geometry) are stored as
-        // NAMES so the export step can rebind them to whatever indices the
-        // re-serialized glTF assigns.
+        // Per-node physics blocks. Cross-references that point at other
+        // resources by index (joint.connectedNode, and mesh/node references
+        // inside collider/trigger geometry) are stored as NAMES so the
+        // export step can rebind them to whatever indices the re-serialized
+        // glTF assigns.
+        //
+        // Several upstream samples (JointTypes, Robot_skinned, WaterWheel)
+        // reuse the same name (`jointSpaceA`, `jointSpaceB`) for every
+        // joint anchor — a `Map<name, block>` would silently drop all but
+        // the last per name. To survive that we keep an ordered list
+        // (perNode) keyed by `(name, occurrence)` and we annotate each
+        // cross-reference with the OCCURRENCE INDEX of the target name in
+        // source order. Babylon's GLTF2Export preserves the relative order
+        // of same-named nodes, so the Nth `jointSpaceA` in source maps to
+        // the Nth `jointSpaceA` in the exported file.
         const byName = new Map();
+        const perNode = [];
+        const nameSeen = new Map();
         nodes.forEach(function (node) {
             const ext = node && node.extensions && node.extensions.KHR_physics_rigid_bodies;
             if (!ext || !node.name) {
@@ -99,6 +111,9 @@
             const cloned = JSON.parse(JSON.stringify(ext));
             indexRefsToNames(cloned, nodes, meshes);
             byName.set(node.name, cloned);
+            const occ = nameSeen.get(node.name) || 0;
+            nameSeen.set(node.name, occ + 1);
+            perNode.push({ name: node.name, occurrence: occ, block: cloned });
         });
 
         const captured = {
@@ -114,7 +129,8 @@
             physicsJoints: rigid && Array.isArray(rigid.physicsJoints)
                 ? JSON.parse(JSON.stringify(rigid.physicsJoints))
                 : [],
-            byName: byName
+            byName: byName,
+            perNode: perNode
         };
 
         scene.metadata = scene.metadata || {};
@@ -618,34 +634,55 @@
             return;
         }
 
-        // Map name -> new index for nodes and meshes so captured references
-        // can be remapped onto Babylon's renumbered output.
-        const nameToNodeIndex = new Map();
+        // Map `name#occurrence` -> new index for nodes (handles duplicates
+        // like the jointSpaceA/B anchors in JointTypes / Robot_skinned /
+        // WaterWheel). Meshes don't tend to collide on name in practice,
+        // but we apply the same scheme there for symmetry.
+        const nodeKeyToIndex = new Map();
+        const nodeOccCounts = new Map();
         json.nodes.forEach(function (node, i) {
-            if (node && node.name) {
-                nameToNodeIndex.set(node.name, i);
-            }
+            if (!node || !node.name) return;
+            const occ = nodeOccCounts.get(node.name) || 0;
+            nodeOccCounts.set(node.name, occ + 1);
+            nodeKeyToIndex.set(node.name + '#' + occ, i);
         });
-        const nameToMeshIndex = new Map();
+        const meshKeyToIndex = new Map();
+        const meshOccCounts = new Map();
         (json.meshes || []).forEach(function (mesh, i) {
-            if (mesh && mesh.name) {
-                nameToMeshIndex.set(mesh.name, i);
-            }
+            if (!mesh || !mesh.name) return;
+            const occ = meshOccCounts.get(mesh.name) || 0;
+            meshOccCounts.set(mesh.name, occ + 1);
+            meshKeyToIndex.set(mesh.name + '#' + occ, i);
         });
 
-        json.nodes.forEach(function (node) {
-            if (!node || !node.name) {
-                return;
-            }
-            const block = captured.byName.get(node.name);
-            if (!block) {
-                return;
-            }
-            const cloned = JSON.parse(JSON.stringify(block));
-            namesToIndexRefs(cloned, nameToNodeIndex, nameToMeshIndex, json.nodes);
-            node.extensions = node.extensions || {};
-            node.extensions.KHR_physics_rigid_bodies = cloned;
-        });
+        // Emit each captured per-node block onto the matching exported
+        // node. We iterate captured.perNode (which preserves duplicates)
+        // rather than json.nodes so each source node lands on the
+        // matching-occurrence exported node, not the first one it sees.
+        const perNode = Array.isArray(captured.perNode) ? captured.perNode : null;
+        if (perNode) {
+            perNode.forEach(function (entry) {
+                const exportedIdx = nodeKeyToIndex.get(entry.name + '#' + entry.occurrence);
+                if (typeof exportedIdx !== 'number') return;
+                const targetNode = json.nodes[exportedIdx];
+                if (!targetNode) return;
+                const cloned = JSON.parse(JSON.stringify(entry.block));
+                namesToIndexRefs(cloned, nodeKeyToIndex, meshKeyToIndex, json.nodes);
+                targetNode.extensions = targetNode.extensions || {};
+                targetNode.extensions.KHR_physics_rigid_bodies = cloned;
+            });
+        } else {
+            // Fallback for captured payloads built before perNode existed.
+            json.nodes.forEach(function (node) {
+                if (!node || !node.name) return;
+                const block = captured.byName && captured.byName.get(node.name);
+                if (!block) return;
+                const cloned = JSON.parse(JSON.stringify(block));
+                namesToIndexRefs(cloned, nodeKeyToIndex, meshKeyToIndex, json.nodes);
+                node.extensions = node.extensions || {};
+                node.extensions.KHR_physics_rigid_bodies = cloned;
+            });
+        }
     }
 
     // Mapping for resource references inside a KHR_physics_rigid_bodies block.
@@ -655,10 +692,28 @@
     // ShapeTypes pointing at the same Plane mesh after a round-trip instead of
     // dangling at the original index.
 
+    // Count how many times `name` has appeared in `nodes[0..targetIdx-1]`.
+    // Used to identify which "Nth occurrence" of a duplicate name we mean,
+    // so cross-references survive samples that reuse `jointSpaceA` /
+    // `jointSpaceB` for every anchor.
+    function occurrenceOfNameAt(nodes, targetIdx, name) {
+        let occ = 0;
+        for (let k = 0; k < targetIdx; k++) {
+            if (nodes[k] && nodes[k].name === name) occ++;
+        }
+        return occ;
+    }
+
     function indexRefsToNames(block, nodes, meshes) {
         if (block.joint && typeof block.joint.connectedNode === 'number') {
-            const connected = nodes[block.joint.connectedNode];
-            block.joint.connectedNodeName = connected ? connected.name : null;
+            const connectedIdx = block.joint.connectedNode;
+            const connected = nodes[connectedIdx];
+            if (connected) {
+                block.joint.connectedNodeName = connected.name;
+                block.joint.connectedNodeOccurrence = occurrenceOfNameAt(nodes, connectedIdx, connected.name);
+            } else {
+                block.joint.connectedNodeName = null;
+            }
             delete block.joint.connectedNode;
         }
         geometryIndexRefsToNames(block.collider && block.collider.geometry, nodes, meshes);
@@ -674,38 +729,65 @@
             // Babylon's GLTF2Export drops mesh names but preserves node names, so
             // also stash the name of any node that owns this mesh — at export
             // time we can look that node up and read its renumbered mesh index.
-            const owner = nodes.find(function (n) { return n && n.mesh === meshIdx; });
+            const ownerIdx = nodes.findIndex(function (n) { return n && n.mesh === meshIdx; });
+            const owner = ownerIdx >= 0 ? nodes[ownerIdx] : null;
             geometry.meshOwnerNodeName = owner ? owner.name : null;
+            geometry.meshOwnerNodeOccurrence = owner ? occurrenceOfNameAt(nodes, ownerIdx, owner.name) : 0;
             delete geometry.mesh;
         }
         if (typeof geometry.node === 'number') {
-            const node = nodes[geometry.node];
-            geometry.nodeName = node ? node.name : null;
+            const nodeIdx = geometry.node;
+            const node = nodes[nodeIdx];
+            if (node) {
+                geometry.nodeName = node.name;
+                geometry.nodeOccurrence = occurrenceOfNameAt(nodes, nodeIdx, node.name);
+            } else {
+                geometry.nodeName = null;
+            }
             delete geometry.node;
         }
     }
 
-    function namesToIndexRefs(block, nameToNodeIndex, nameToMeshIndex, jsonNodes) {
+    function nodeIndexFromNameOcc(nodeKeyToIndex, name, occurrence) {
+        if (name == null) return undefined;
+        const occ = typeof occurrence === 'number' ? occurrence : 0;
+        const idx = nodeKeyToIndex.get(name + '#' + occ);
+        if (typeof idx === 'number') return idx;
+        // Fall back to first occurrence in case the upstream payload was
+        // captured before occurrence tracking landed.
+        return nodeKeyToIndex.get(name + '#0');
+    }
+
+    function meshIndexFromNameOcc(meshKeyToIndex, name, occurrence) {
+        if (name == null) return undefined;
+        const occ = typeof occurrence === 'number' ? occurrence : 0;
+        const idx = meshKeyToIndex.get(name + '#' + occ);
+        if (typeof idx === 'number') return idx;
+        return meshKeyToIndex.get(name + '#0');
+    }
+
+    function namesToIndexRefs(block, nodeKeyToIndex, meshKeyToIndex, jsonNodes) {
         if (block.joint && block.joint.connectedNodeName != null) {
-            const idx = nameToNodeIndex.get(block.joint.connectedNodeName);
+            const idx = nodeIndexFromNameOcc(nodeKeyToIndex, block.joint.connectedNodeName, block.joint.connectedNodeOccurrence);
             if (typeof idx === 'number') {
                 block.joint.connectedNode = idx;
             }
             delete block.joint.connectedNodeName;
+            delete block.joint.connectedNodeOccurrence;
         }
-        geometryNamesToIndexRefs(block.collider && block.collider.geometry, nameToNodeIndex, nameToMeshIndex, jsonNodes);
-        geometryNamesToIndexRefs(block.trigger && block.trigger.geometry, nameToNodeIndex, nameToMeshIndex, jsonNodes);
+        geometryNamesToIndexRefs(block.collider && block.collider.geometry, nodeKeyToIndex, meshKeyToIndex, jsonNodes);
+        geometryNamesToIndexRefs(block.trigger && block.trigger.geometry, nodeKeyToIndex, meshKeyToIndex, jsonNodes);
     }
 
-    function geometryNamesToIndexRefs(geometry, nameToNodeIndex, nameToMeshIndex, jsonNodes) {
+    function geometryNamesToIndexRefs(geometry, nodeKeyToIndex, meshKeyToIndex, jsonNodes) {
         if (!geometry) return;
         if (geometry.meshName != null || geometry.meshOwnerNodeName != null) {
             let idx;
             if (geometry.meshName != null) {
-                idx = nameToMeshIndex.get(geometry.meshName);
+                idx = meshIndexFromNameOcc(meshKeyToIndex, geometry.meshName, 0);
             }
             if (typeof idx !== 'number' && geometry.meshOwnerNodeName != null) {
-                const ownerIdx = nameToNodeIndex.get(geometry.meshOwnerNodeName);
+                const ownerIdx = nodeIndexFromNameOcc(nodeKeyToIndex, geometry.meshOwnerNodeName, geometry.meshOwnerNodeOccurrence);
                 if (typeof ownerIdx === 'number') {
                     const ownerNode = jsonNodes[ownerIdx];
                     if (ownerNode && typeof ownerNode.mesh === 'number') {
@@ -721,15 +803,17 @@
             }
             delete geometry.meshName;
             delete geometry.meshOwnerNodeName;
+            delete geometry.meshOwnerNodeOccurrence;
         }
         if (geometry.nodeName != null) {
-            const idx = nameToNodeIndex.get(geometry.nodeName);
+            const idx = nodeIndexFromNameOcc(nodeKeyToIndex, geometry.nodeName, geometry.nodeOccurrence);
             if (typeof idx === 'number') {
                 geometry.node = idx;
             } else {
                 console.warn('[GLTFPhysicsExport] No exported node matches captured name:', geometry.nodeName);
             }
             delete geometry.nodeName;
+            delete geometry.nodeOccurrence;
         }
     }
 
@@ -855,10 +939,15 @@
         const nodes = json.nodes || [];
         const meshes = json.meshes || [];
 
+        // Key per-node entries by `name#occurrence` so duplicate names
+        // (jointSpaceA / jointSpaceB) round-trip without entries colliding.
         const perNode = new Map();
+        const seen = new Map();
         nodes.forEach(function (n) {
             const ext = n && n.extensions && n.extensions.KHR_physics_rigid_bodies;
             if (!ext || !n.name) return;
+            const occ = seen.get(n.name) || 0;
+            seen.set(n.name, occ + 1);
             const cloned = JSON.parse(JSON.stringify(ext));
             indexRefsToNames(cloned, nodes, meshes);
             // Babylon's GLTF2Export drops mesh names but preserves node names,
@@ -866,7 +955,7 @@
             // compare only via the owning-node name, which survives.
             stripMeshName(cloned.collider && cloned.collider.geometry);
             stripMeshName(cloned.trigger && cloned.trigger.geometry);
-            perNode.set(n.name, cloned);
+            perNode.set(n.name + '#' + occ, cloned);
         });
 
         return {
