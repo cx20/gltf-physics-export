@@ -896,7 +896,21 @@
 
         json.extensions = json.extensions || {};
         json.extensions.KHR_implicit_shapes = { shapes: data.shapes };
-        json.extensions.KHR_physics_rigid_bodies = { physicsMaterials: data.materials };
+
+        // Emit the top-level reference arrays. collisionFilters MUST be
+        // written whenever any collider carries a collisionFilter index:
+        // the rigid-body loader does `collisionFilters[collider.collisionFilter]`
+        // and a collisionFilter of 0 (a valid index) still passes its
+        // `!= null` guard, so a missing array throws
+        // "Cannot read properties of undefined (reading '0')" on load.
+        const rigid = {};
+        if (data.materials && data.materials.length) {
+            rigid.physicsMaterials = data.materials;
+        }
+        if (data.collisionFilters && data.collisionFilters.length) {
+            rigid.collisionFilters = data.collisionFilters;
+        }
+        json.extensions.KHR_physics_rigid_bodies = rigid;
 
         if (!Array.isArray(json.nodes)) {
             return;
