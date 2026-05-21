@@ -681,11 +681,20 @@
             console.warn('[GLTFPhysicsExport] Skipping mesh with unsupported physics shape:', mesh.name);
             return null;
         }
-        const shapeIndex = pushUnique(shapes, shapeSpec);
         const matIndex = pushUnique(materials, describeMaterial(mesh));
 
+        const geometry = {};
+        if (shapeSpec.meshGeometry) {
+            // `useMesh` is an internal marker; inject resolves it to the
+            // exported node's mesh index (collider.geometry.mesh).
+            geometry.useMesh = true;
+            if (shapeSpec.convexHull) geometry.convexHull = true;
+        } else {
+            geometry.shape = pushUnique(shapes, shapeSpec);
+        }
+
         const body = {
-            collider: { geometry: { shape: shapeIndex }, physicsMaterial: matIndex }
+            collider: { geometry: geometry, physicsMaterial: matIndex }
         };
         const filterSpec = describeCollisionFilter(mesh);
         if (filterSpec) {
@@ -706,7 +715,7 @@
     // exported filters round-trip through the rigid-body loader, which
     // remaps the same names back to bitmasks at load time.
     function describeCollisionFilter(mesh) {
-        const shape = mesh.aggregate && mesh.aggregate.shape;
+        const shape = getPhysicsShape(mesh);
         if (!shape) return null;
         const membership = shape.filterMembershipMask;
         const collide = shape.filterCollideMask;
@@ -735,12 +744,33 @@
         return names;
     }
 
+    // Resolve the physics shape from either a PhysicsAggregate stored on the
+    // mesh (mesh.aggregate) or directly from its PhysicsBody, so scenes that
+    // don't keep an `aggregate` back-reference still export — e.g. a
+    // CreateGround floor whose aggregate lives only in a local variable.
+    function getPhysicsShape(mesh) {
+        return (mesh && mesh.aggregate && mesh.aggregate.shape)
+            || (mesh && mesh.physicsBody && mesh.physicsBody.shape)
+            || null;
+    }
+
     function describeShape(mesh) {
-        const aggregate = mesh.aggregate;
-        const shape = aggregate && aggregate.shape;
+        const shape = getPhysicsShape(mesh);
         if (!shape) {
             return null;
         }
+
+        // Mesh / convex-hull colliders reference the node's own glTF mesh
+        // (collider.geometry.mesh) rather than an implicit shape. The actual
+        // mesh index is resolved at inject time from the exported node, so
+        // here we only flag the intent.
+        if (shape.type === BABYLON.PhysicsShapeType.MESH) {
+            return { meshGeometry: true, convexHull: false };
+        }
+        if (shape.type === BABYLON.PhysicsShapeType.CONVEX_HULL) {
+            return { meshGeometry: true, convexHull: true };
+        }
+
         const bb = mesh.getBoundingInfo().boundingBox;
         const extents = bb.extendSize; // half-extents in local space
 
@@ -774,16 +804,17 @@
         const aggregate = mesh.aggregate;
         let friction = 0.5;
         let restitution = 0.0;
-        if (aggregate) {
-            if (aggregate.material) {
-                if (typeof aggregate.material.friction === 'number') friction = aggregate.material.friction;
-                if (typeof aggregate.material.restitution === 'number') restitution = aggregate.material.restitution;
-            }
-            if (aggregate.shape && aggregate.shape.material) {
-                const m = aggregate.shape.material;
-                if (typeof m.friction === 'number') friction = m.friction;
-                if (typeof m.restitution === 'number') restitution = m.restitution;
-            }
+        if (aggregate && aggregate.material) {
+            if (typeof aggregate.material.friction === 'number') friction = aggregate.material.friction;
+            if (typeof aggregate.material.restitution === 'number') restitution = aggregate.material.restitution;
+        }
+        // The shape's material (reachable via aggregate or PhysicsBody) takes
+        // precedence and also covers aggregate-less bodies.
+        const shape = getPhysicsShape(mesh);
+        if (shape && shape.material) {
+            const m = shape.material;
+            if (typeof m.friction === 'number') friction = m.friction;
+            if (typeof m.restitution === 'number') restitution = m.restitution;
         }
         return {
             staticFriction: friction,
@@ -920,8 +951,21 @@
             if (!body) {
                 return;
             }
+            // Clone so a second export doesn't see a mesh-resolved body.
+            const cloned = JSON.parse(JSON.stringify(body));
+            const geo = cloned.collider && cloned.collider.geometry;
+            if (geo && geo.useMesh) {
+                // A mesh / convex-hull collider references the node's own glTF
+                // mesh. The exported node carries its render mesh index here.
+                if (typeof node.mesh === 'number') {
+                    geo.mesh = node.mesh;
+                } else {
+                    console.warn('[GLTFPhysicsExport] mesh-shape collider on a node without a mesh:', node.name);
+                }
+                delete geo.useMesh;
+            }
             node.extensions = node.extensions || {};
-            node.extensions.KHR_physics_rigid_bodies = body;
+            node.extensions.KHR_physics_rigid_bodies = cloned;
         });
     }
 
