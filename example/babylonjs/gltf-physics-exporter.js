@@ -262,12 +262,34 @@
 
         let json;
         let bin = null;
+        let rawText = null;
+        let rawBuffer = null;
         if (isGltf) {
-            json = await response.json();
+            rawText = await response.text();
+            json = JSON.parse(rawText);
         } else {
-            const parsed = parseGLB(await response.arrayBuffer());
+            rawBuffer = await response.arrayBuffer();
+            const parsed = parseGLB(rawBuffer);
             json = parsed.json;
             bin = parsed.bin;
+        }
+
+        // Fast path: a model that declares no physics extensions has nothing
+        // to round-trip, so append its ORIGINAL bytes untouched. This lets a
+        // generic viewer route every model through appendTaggedAsync without
+        // re-encoding (or even tagging) arbitrary non-physics content.
+        const declared = json.extensionsUsed || [];
+        const hasPhysics = declared.indexOf('KHR_physics_rigid_bodies') >= 0
+            || declared.indexOf('KHR_implicit_shapes') >= 0
+            || declared.indexOf('MSFT_rigid_bodies') >= 0
+            || declared.indexOf('MSFT_collision_primitives') >= 0;
+        if (!hasPhysics) {
+            const passBlob = isGltf
+                ? new Blob([rawText], { type: 'model/gltf+json' })
+                : new Blob([rawBuffer], { type: 'model/gltf-binary' });
+            const passFile = new File([passBlob], fileName, { type: passBlob.type });
+            await BABYLON.SceneLoader.AppendAsync(rootUrl, passFile, scene, null, isGltf ? '.gltf' : '.glb');
+            return;
         }
 
         (json.nodes || []).forEach(function (node, i) {

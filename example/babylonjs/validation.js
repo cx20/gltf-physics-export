@@ -129,6 +129,42 @@ function setDetails(name, diffs, errorMessage) {
     row.details.appendChild(pre);
 }
 
+// Count nodes that actually carry a Havok physics body in a scene.
+function countPhysicsBodies(scene) {
+    let n = 0;
+    const seen = new Set();
+    const visit = function (node) {
+        if (!node || seen.has(node)) return;
+        if (node.physicsBody) { seen.add(node); n++; }
+    };
+    (scene.meshes || []).forEach(visit);
+    (scene.transformNodes || []).forEach(visit);
+    return n;
+}
+
+// Strong check: export the captured scene, RE-LOAD the exported .glb with
+// the same rigid-body loader, and confirm it produces the same number of
+// physics bodies. The JSON diff in validateRoundTripAsync compares the
+// source against a re-injected clone of itself, so it can't catch a glb
+// that fails to rebuild physics on load (e.g. a collider whose shape the
+// loader can't reconstruct). This re-load actually exercises the output.
+async function reloadBodyCheck(sourceScene, engine) {
+    const sourceCount = countPhysicsBodies(sourceScene);
+    // Export the user-facing format (src-node tags stripped).
+    const outBuffer = await BABYLON.GLTFPhysicsExport.GLBAsync(sourceScene, 'reload-check', { download: false });
+    const reScene = new BABYLON.Scene(engine);
+    try {
+        reScene.enablePhysics(new BABYLON.Vector3(0, -9.8, 0), new BABYLON.HavokPlugin());
+        const blob = new Blob([outBuffer], { type: 'model/gltf-binary' });
+        const file = new File([blob], 'reload-check.glb', { type: 'model/gltf-binary' });
+        await BABYLON.SceneLoader.AppendAsync('', file, reScene, null, '.glb');
+        const reloadedCount = countPhysicsBodies(reScene);
+        return { sourceCount: sourceCount, reloadedCount: reloadedCount };
+    } finally {
+        reScene.dispose();
+    }
+}
+
 async function runOne(entry, engine) {
     const scene = new BABYLON.Scene(engine);
     try {
@@ -141,12 +177,29 @@ async function runOne(entry, engine) {
         await BABYLON.GLTFPhysicsExport.appendTaggedAsync(scene, entry.url);
         await BABYLON.GLTFPhysicsExport.captureLoadedAsync(scene, entry.url);
         const result = await BABYLON.GLTFPhysicsExport.validateRoundTripAsync(scene, entry.url);
-        if (result.pass) {
+        const diffs = (result.diffs || []).slice();
+
+        // Re-load the exported glb and verify physics bodies are rebuilt.
+        let reload = null;
+        try {
+            reload = await reloadBodyCheck(scene, engine);
+            if (reload.sourceCount !== reload.reloadedCount) {
+                diffs.push({
+                    path: 'reload',
+                    reason: 'physics bodies ' + reload.sourceCount + ' (source) vs '
+                        + reload.reloadedCount + ' (reloaded export)'
+                });
+            }
+        } catch (err) {
+            diffs.push({ path: 'reload', reason: 'export failed to re-load: ' + (err && err.message ? err.message : String(err)) });
+        }
+
+        if (diffs.length === 0) {
             setStatus(entry.name, 'pass', 'PASS');
             setDetails(entry.name, null);
         } else {
-            setStatus(entry.name, 'fail', 'FAIL (' + result.diffs.length + ')');
-            setDetails(entry.name, result.diffs);
+            setStatus(entry.name, 'fail', 'FAIL (' + diffs.length + ')');
+            setDetails(entry.name, diffs);
         }
     } finally {
         scene.dispose();
