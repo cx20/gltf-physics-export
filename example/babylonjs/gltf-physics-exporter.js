@@ -77,6 +77,72 @@
         return parseGLB(arrayBuffer).json;
     }
 
+    // Stable per-node identity tag. We plant `node.extras[SRC_NODE_TAG] =
+    // <source index>` in the source glTF before Babylon loads it (see
+    // appendTaggedAsync). Babylon's glTF loader copies node.extras into
+    // `babylonNode.metadata.gltf.extras`, and GLTF2Export's default
+    // metadataSelector copies it back to `node.extras` on the way out, so
+    // the source index round-trips even for nameless / duplicate-named
+    // nodes and survives Babylon's node renumbering. The inject step keys
+    // off this tag to relink captured blocks onto the renumbered output.
+    const SRC_NODE_TAG = '__gltfPhysicsSrcNodeIdx';
+
+    // Load a glTF/glb but first stamp every node with its source index
+    // (and patch missing top-level extension placeholders that crash the
+    // rigid-body loader). Use this in place of SceneLoader.AppendAsync so
+    // captureLoadedAsync/GLBAsync can round-trip physics reliably.
+    async function appendTaggedAsync(scene, sourceUrl) {
+        const slash = sourceUrl.lastIndexOf('/');
+        const rootUrl = sourceUrl.substring(0, slash + 1);
+        const fileName = sourceUrl.substring(slash + 1);
+        const isGltf = /\.gltf(\?.*)?$/i.test(fileName);
+
+        const response = await fetch(sourceUrl);
+        if (!response.ok) {
+            throw new Error('appendTaggedAsync: fetch failed for ' + sourceUrl + ': ' + response.status);
+        }
+
+        let json;
+        let bin = null;
+        if (isGltf) {
+            json = await response.json();
+        } else {
+            const parsed = parseGLB(await response.arrayBuffer());
+            json = parsed.json;
+            bin = parsed.bin;
+        }
+
+        (json.nodes || []).forEach(function (node, i) {
+            node.extras = node.extras || {};
+            node.extras[SRC_NODE_TAG] = i;
+        });
+
+        // The cx20 rigid-body loader dereferences gltf.extensions.<name>
+        // whenever <name> appears in extensionsUsed; some tests list it
+        // without a top-level block, so splice empty placeholders in.
+        const used = json.extensionsUsed || [];
+        if (used.indexOf('KHR_implicit_shapes') >= 0 || used.indexOf('KHR_physics_rigid_bodies') >= 0) {
+            json.extensions = json.extensions || {};
+            if (used.indexOf('KHR_implicit_shapes') >= 0 && !json.extensions.KHR_implicit_shapes) {
+                json.extensions.KHR_implicit_shapes = { shapes: [] };
+            }
+            if (used.indexOf('KHR_physics_rigid_bodies') >= 0 && !json.extensions.KHR_physics_rigid_bodies) {
+                json.extensions.KHR_physics_rigid_bodies = {};
+            }
+        }
+
+        if (isGltf) {
+            const blob = new Blob([JSON.stringify(json)], { type: 'model/gltf+json' });
+            const file = new File([blob], fileName, { type: 'model/gltf+json' });
+            await BABYLON.SceneLoader.AppendAsync(rootUrl, file, scene, null, '.gltf');
+        } else {
+            const outBuf = buildGLB(json, bin);
+            const blob = new Blob([outBuf], { type: 'model/gltf-binary' });
+            const file = new File([blob], fileName, { type: 'model/gltf-binary' });
+            await BABYLON.SceneLoader.AppendAsync(rootUrl, file, scene, null, '.glb');
+        }
+    }
+
     async function captureLoadedAsync(scene, sourceUrl) {
         const json = await fetchSourceJson(sourceUrl);
 
@@ -87,33 +153,39 @@
 
         // Per-node physics blocks. Cross-references that point at other
         // resources by index (joint.connectedNode, and mesh/node references
-        // inside collider/trigger geometry) are stored as NAMES so the
-        // export step can rebind them to whatever indices the re-serialized
-        // glTF assigns.
-        //
-        // Several upstream samples (JointTypes, Robot_skinned, WaterWheel)
-        // reuse the same name (`jointSpaceA`, `jointSpaceB`) for every
-        // joint anchor — a `Map<name, block>` would silently drop all but
-        // the last per name. To survive that we keep an ordered list
-        // (perNode) keyed by `(name, occurrence)` and we annotate each
-        // cross-reference with the OCCURRENCE INDEX of the target name in
-        // source order. Babylon's GLTF2Export preserves the relative order
-        // of same-named nodes, so the Nth `jointSpaceA` in source maps to
-        // the Nth `jointSpaceA` in the exported file.
+        // inside collider/trigger geometry) are stored alongside the
+        // SOURCE INDEX so the export step can rebind them through the
+        // extras-tagged output. Name + occurrence are kept as a fallback
+        // for cases where the tag does not survive (Babylon dropping
+        // extras on certain nodes).
         const byName = new Map();
         const perNode = [];
         const nameSeen = new Map();
-        nodes.forEach(function (node) {
+        nodes.forEach(function (node, i) {
             const ext = node && node.extensions && node.extensions.KHR_physics_rigid_bodies;
-            if (!ext || !node.name) {
-                return;
-            }
+            if (!ext) return;
             const cloned = JSON.parse(JSON.stringify(ext));
             indexRefsToNames(cloned, nodes, meshes);
-            byName.set(node.name, cloned);
-            const occ = nameSeen.get(node.name) || 0;
-            nameSeen.set(node.name, occ + 1);
-            perNode.push({ name: node.name, occurrence: occ, block: cloned });
+            const entry = { srcIdx: i, name: node.name || null, block: cloned };
+            if (node.name) {
+                byName.set(node.name, cloned);
+                const occ = nameSeen.get(node.name) || 0;
+                nameSeen.set(node.name, occ + 1);
+                entry.occurrence = occ;
+            }
+            perNode.push(entry);
+        });
+
+        // Pre-compute which source node owns which source mesh. The
+        // inject step uses this together with the extras-tagged exported
+        // nodes to remap collision-mesh references — Babylon's
+        // GLTF2Export tends to drop mesh names, so we cannot rely on
+        // them alone.
+        const srcMeshOwners = [];
+        nodes.forEach(function (node, i) {
+            if (node && typeof node.mesh === 'number') {
+                srcMeshOwners.push({ srcNodeIdx: i, srcMeshIdx: node.mesh });
+            }
         });
 
         const captured = {
@@ -130,7 +202,8 @@
                 ? JSON.parse(JSON.stringify(rigid.physicsJoints))
                 : [],
             byName: byName,
-            perNode: perNode
+            perNode: perNode,
+            srcMeshOwners: srcMeshOwners
         };
 
         scene.metadata = scene.metadata || {};
@@ -319,6 +392,18 @@
                         return true;
                     }
                     return !(node instanceof BABYLON.Light);
+                },
+                // GLTF2Export only writes node.extras when a metadataSelector is
+                // supplied; without this our __gltfPhysicsSrcNodeIdx tags never
+                // reach the output and the inject step can't relink nameless /
+                // duplicate-named nodes. Return only the gltf.extras sub-object
+                // so we don't accidentally dump the whole captured payload
+                // (which lives on scene.metadata) into the scene's extras.
+                metadataSelector: function (metadata) {
+                    if (metadata && metadata.gltf && metadata.gltf.extras) {
+                        return metadata.gltf.extras;
+                    }
+                    return undefined;
                 }
             };
 
@@ -338,6 +423,14 @@
                 injectPhysicsExtensions(json, derived);
             }
 
+            // The __gltfPhysicsSrcNodeIdx tags are an internal staging aid
+            // for relinking; strip them from the user's downloaded file.
+            // validateRoundTripAsync passes keepSrcNodeTags so the diff can
+            // match nodes by source index.
+            if (!options.keepSrcNodeTags) {
+                stripSrcNodeTags(json);
+            }
+
             const outBuffer = buildGLB(json, bin);
             if (options.download !== false) {
                 triggerDownload(outBuffer, baseName + '.glb');
@@ -346,6 +439,15 @@
         } finally {
             restore();
         }
+    }
+
+    function stripSrcNodeTags(json) {
+        (json.nodes || []).forEach(function (node) {
+            if (node && node.extras && SRC_NODE_TAG in node.extras) {
+                delete node.extras[SRC_NODE_TAG];
+                if (Object.keys(node.extras).length === 0) delete node.extras;
+            }
+        });
     }
 
     // --- physics data collection (programmatic scenes) ---
@@ -634,10 +736,19 @@
             return;
         }
 
-        // Map `name#occurrence` -> new index for nodes (handles duplicates
-        // like the jointSpaceA/B anchors in JointTypes / Robot_skinned /
-        // WaterWheel). Meshes don't tend to collide on name in practice,
-        // but we apply the same scheme there for symmetry.
+        // PRIMARY mapping: source node index -> exported node index, read
+        // from the `__gltfPhysicsSrcNodeIdx` extras we planted on every
+        // Babylon node during capture. This survives nameless or
+        // duplicate-named nodes that name-based lookup can't disambiguate.
+        const srcNodeToExportedIdx = new Map();
+        json.nodes.forEach(function (node, i) {
+            const srcIdx = node && node.extras && node.extras[SRC_NODE_TAG];
+            if (typeof srcIdx === 'number') srcNodeToExportedIdx.set(srcIdx, i);
+        });
+
+        // FALLBACK mapping: `name#occurrence` -> exported index. Used
+        // when the extras tag is missing (e.g. nodes Babylon added
+        // during serialization).
         const nodeKeyToIndex = new Map();
         const nodeOccCounts = new Map();
         json.nodes.forEach(function (node, i) {
@@ -655,19 +766,48 @@
             meshKeyToIndex.set(mesh.name + '#' + occ, i);
         });
 
+        // Source-mesh -> exported-mesh, derived from owner-node mapping.
+        // For each source node that carried a mesh, look up the matching
+        // exported node by srcNodeIdx and read its `mesh` field — that
+        // gives us a reliable srcMeshIdx -> exportedMeshIdx without
+        // depending on mesh names (Babylon usually drops them).
+        const srcMeshToExportedIdx = new Map();
+        (captured.srcMeshOwners || []).forEach(function (owner) {
+            const expIdx = srcNodeToExportedIdx.get(owner.srcNodeIdx);
+            if (typeof expIdx !== 'number') return;
+            const expNode = json.nodes[expIdx];
+            if (expNode && typeof expNode.mesh === 'number') {
+                srcMeshToExportedIdx.set(owner.srcMeshIdx, expNode.mesh);
+            }
+        });
+
+        const resolveCtx = {
+            srcNodeToExportedIdx: srcNodeToExportedIdx,
+            srcMeshToExportedIdx: srcMeshToExportedIdx,
+            nodeKeyToIndex: nodeKeyToIndex,
+            meshKeyToIndex: meshKeyToIndex,
+            jsonNodes: json.nodes
+        };
+
         // Emit each captured per-node block onto the matching exported
-        // node. We iterate captured.perNode (which preserves duplicates)
-        // rather than json.nodes so each source node lands on the
-        // matching-occurrence exported node, not the first one it sees.
+        // node. PRIMARY lookup uses srcIdx via the extras tag (handles
+        // nameless / duplicate-named nodes); FALLBACK uses name +
+        // occurrence.
         const perNode = Array.isArray(captured.perNode) ? captured.perNode : null;
         if (perNode) {
             perNode.forEach(function (entry) {
-                const exportedIdx = nodeKeyToIndex.get(entry.name + '#' + entry.occurrence);
+                let exportedIdx;
+                if (typeof entry.srcIdx === 'number') {
+                    exportedIdx = srcNodeToExportedIdx.get(entry.srcIdx);
+                }
+                if (typeof exportedIdx !== 'number' && entry.name) {
+                    exportedIdx = nodeKeyToIndex.get(entry.name + '#' + (entry.occurrence || 0));
+                }
                 if (typeof exportedIdx !== 'number') return;
                 const targetNode = json.nodes[exportedIdx];
                 if (!targetNode) return;
                 const cloned = JSON.parse(JSON.stringify(entry.block));
-                namesToIndexRefs(cloned, nodeKeyToIndex, meshKeyToIndex, json.nodes);
+                namesToIndexRefs(cloned, resolveCtx);
                 targetNode.extensions = targetNode.extensions || {};
                 targetNode.extensions.KHR_physics_rigid_bodies = cloned;
             });
@@ -678,7 +818,7 @@
                 const block = captured.byName && captured.byName.get(node.name);
                 if (!block) return;
                 const cloned = JSON.parse(JSON.stringify(block));
-                namesToIndexRefs(cloned, nodeKeyToIndex, meshKeyToIndex, json.nodes);
+                namesToIndexRefs(cloned, resolveCtx);
                 node.extensions = node.extensions || {};
                 node.extensions.KHR_physics_rigid_bodies = cloned;
             });
@@ -708,9 +848,12 @@
         if (block.joint && typeof block.joint.connectedNode === 'number') {
             const connectedIdx = block.joint.connectedNode;
             const connected = nodes[connectedIdx];
+            block.joint.connectedNodeSrcIdx = connectedIdx;
             if (connected) {
-                block.joint.connectedNodeName = connected.name;
-                block.joint.connectedNodeOccurrence = occurrenceOfNameAt(nodes, connectedIdx, connected.name);
+                block.joint.connectedNodeName = connected.name || null;
+                if (connected.name) {
+                    block.joint.connectedNodeOccurrence = occurrenceOfNameAt(nodes, connectedIdx, connected.name);
+                }
             } else {
                 block.joint.connectedNodeName = null;
             }
@@ -725,22 +868,34 @@
         if (typeof geometry.mesh === 'number') {
             const meshIdx = geometry.mesh;
             const mesh = meshes[meshIdx];
-            geometry.meshName = mesh ? mesh.name : null;
+            geometry.meshSrcIdx = meshIdx;
+            geometry.meshName = mesh ? (mesh.name || null) : null;
             // Babylon's GLTF2Export drops mesh names but preserves node names, so
-            // also stash the name of any node that owns this mesh — at export
-            // time we can look that node up and read its renumbered mesh index.
+            // also stash the source index AND name of any node that owns this
+            // mesh — at export time we look the node up (via extras-tag or name
+            // fallback) and read its renumbered mesh index.
             const ownerIdx = nodes.findIndex(function (n) { return n && n.mesh === meshIdx; });
-            const owner = ownerIdx >= 0 ? nodes[ownerIdx] : null;
-            geometry.meshOwnerNodeName = owner ? owner.name : null;
-            geometry.meshOwnerNodeOccurrence = owner ? occurrenceOfNameAt(nodes, ownerIdx, owner.name) : 0;
+            if (ownerIdx >= 0) {
+                const owner = nodes[ownerIdx];
+                geometry.meshOwnerSrcNodeIdx = ownerIdx;
+                geometry.meshOwnerNodeName = owner.name || null;
+                if (owner.name) {
+                    geometry.meshOwnerNodeOccurrence = occurrenceOfNameAt(nodes, ownerIdx, owner.name);
+                }
+            } else {
+                geometry.meshOwnerNodeName = null;
+            }
             delete geometry.mesh;
         }
         if (typeof geometry.node === 'number') {
             const nodeIdx = geometry.node;
             const node = nodes[nodeIdx];
+            geometry.nodeSrcIdx = nodeIdx;
             if (node) {
-                geometry.nodeName = node.name;
-                geometry.nodeOccurrence = occurrenceOfNameAt(nodes, nodeIdx, node.name);
+                geometry.nodeName = node.name || null;
+                if (node.name) {
+                    geometry.nodeOccurrence = occurrenceOfNameAt(nodes, nodeIdx, node.name);
+                }
             } else {
                 geometry.nodeName = null;
             }
@@ -766,52 +921,81 @@
         return meshKeyToIndex.get(name + '#0');
     }
 
-    function namesToIndexRefs(block, nodeKeyToIndex, meshKeyToIndex, jsonNodes) {
-        if (block.joint && block.joint.connectedNodeName != null) {
-            const idx = nodeIndexFromNameOcc(nodeKeyToIndex, block.joint.connectedNodeName, block.joint.connectedNodeOccurrence);
-            if (typeof idx === 'number') {
-                block.joint.connectedNode = idx;
+    function namesToIndexRefs(block, ctx) {
+        if (block.joint && (block.joint.connectedNodeSrcIdx != null || block.joint.connectedNodeName != null)) {
+            let idx;
+            if (typeof block.joint.connectedNodeSrcIdx === 'number') {
+                idx = ctx.srcNodeToExportedIdx.get(block.joint.connectedNodeSrcIdx);
             }
+            if (typeof idx !== 'number' && block.joint.connectedNodeName != null) {
+                idx = nodeIndexFromNameOcc(ctx.nodeKeyToIndex, block.joint.connectedNodeName, block.joint.connectedNodeOccurrence);
+            }
+            if (typeof idx === 'number') block.joint.connectedNode = idx;
+            delete block.joint.connectedNodeSrcIdx;
             delete block.joint.connectedNodeName;
             delete block.joint.connectedNodeOccurrence;
         }
-        geometryNamesToIndexRefs(block.collider && block.collider.geometry, nodeKeyToIndex, meshKeyToIndex, jsonNodes);
-        geometryNamesToIndexRefs(block.trigger && block.trigger.geometry, nodeKeyToIndex, meshKeyToIndex, jsonNodes);
+        geometryNamesToIndexRefs(block.collider && block.collider.geometry, ctx);
+        geometryNamesToIndexRefs(block.trigger && block.trigger.geometry, ctx);
     }
 
-    function geometryNamesToIndexRefs(geometry, nodeKeyToIndex, meshKeyToIndex, jsonNodes) {
+    function geometryNamesToIndexRefs(geometry, ctx) {
         if (!geometry) return;
-        if (geometry.meshName != null || geometry.meshOwnerNodeName != null) {
+        if (geometry.meshSrcIdx != null || geometry.meshName != null || geometry.meshOwnerSrcNodeIdx != null || geometry.meshOwnerNodeName != null) {
             let idx;
-            if (geometry.meshName != null) {
-                idx = meshIndexFromNameOcc(meshKeyToIndex, geometry.meshName, 0);
+            // 1) srcMeshIdx via owner-node extras tag.
+            if (typeof geometry.meshSrcIdx === 'number') {
+                idx = ctx.srcMeshToExportedIdx.get(geometry.meshSrcIdx);
             }
+            // 2) Owner srcNodeIdx -> exported node -> its mesh field.
+            if (typeof idx !== 'number' && typeof geometry.meshOwnerSrcNodeIdx === 'number') {
+                const ownerExportedIdx = ctx.srcNodeToExportedIdx.get(geometry.meshOwnerSrcNodeIdx);
+                if (typeof ownerExportedIdx === 'number') {
+                    const ownerNode = ctx.jsonNodes[ownerExportedIdx];
+                    if (ownerNode && typeof ownerNode.mesh === 'number') idx = ownerNode.mesh;
+                }
+            }
+            // 3) Mesh name fallback (Babylon often drops these but try anyway).
+            if (typeof idx !== 'number' && geometry.meshName != null) {
+                idx = meshIndexFromNameOcc(ctx.meshKeyToIndex, geometry.meshName, 0);
+            }
+            // 4) Owner name fallback.
             if (typeof idx !== 'number' && geometry.meshOwnerNodeName != null) {
-                const ownerIdx = nodeIndexFromNameOcc(nodeKeyToIndex, geometry.meshOwnerNodeName, geometry.meshOwnerNodeOccurrence);
+                const ownerIdx = nodeIndexFromNameOcc(ctx.nodeKeyToIndex, geometry.meshOwnerNodeName, geometry.meshOwnerNodeOccurrence);
                 if (typeof ownerIdx === 'number') {
-                    const ownerNode = jsonNodes[ownerIdx];
-                    if (ownerNode && typeof ownerNode.mesh === 'number') {
-                        idx = ownerNode.mesh;
-                    }
+                    const ownerNode = ctx.jsonNodes[ownerIdx];
+                    if (ownerNode && typeof ownerNode.mesh === 'number') idx = ownerNode.mesh;
                 }
             }
             if (typeof idx === 'number') {
                 geometry.mesh = idx;
             } else {
                 console.warn('[GLTFPhysicsExport] Could not resolve collider mesh ref:',
-                    geometry.meshName, 'owner:', geometry.meshOwnerNodeName);
+                    'srcMeshIdx=', geometry.meshSrcIdx,
+                    'meshName=', geometry.meshName,
+                    'ownerSrcIdx=', geometry.meshOwnerSrcNodeIdx,
+                    'ownerName=', geometry.meshOwnerNodeName);
             }
+            delete geometry.meshSrcIdx;
             delete geometry.meshName;
+            delete geometry.meshOwnerSrcNodeIdx;
             delete geometry.meshOwnerNodeName;
             delete geometry.meshOwnerNodeOccurrence;
         }
-        if (geometry.nodeName != null) {
-            const idx = nodeIndexFromNameOcc(nodeKeyToIndex, geometry.nodeName, geometry.nodeOccurrence);
+        if (geometry.nodeSrcIdx != null || geometry.nodeName != null) {
+            let idx;
+            if (typeof geometry.nodeSrcIdx === 'number') {
+                idx = ctx.srcNodeToExportedIdx.get(geometry.nodeSrcIdx);
+            }
+            if (typeof idx !== 'number' && geometry.nodeName != null) {
+                idx = nodeIndexFromNameOcc(ctx.nodeKeyToIndex, geometry.nodeName, geometry.nodeOccurrence);
+            }
             if (typeof idx === 'number') {
                 geometry.node = idx;
             } else {
-                console.warn('[GLTFPhysicsExport] No exported node matches captured name:', geometry.nodeName);
+                console.warn('[GLTFPhysicsExport] No exported node matches captured ref:', geometry.nodeName, geometry.nodeSrcIdx);
             }
+            delete geometry.nodeSrcIdx;
             delete geometry.nodeName;
             delete geometry.nodeOccurrence;
         }
@@ -917,7 +1101,7 @@
     async function validateRoundTripAsync(scene, sourceUrl) {
         const sourceJson = await fetchSourceJson(sourceUrl);
 
-        const outBuffer = await GLBAsync(scene, 'roundtrip-validation', { download: false });
+        const outBuffer = await GLBAsync(scene, 'roundtrip-validation', { download: false, keepSrcNodeTags: true });
         const exportedJson = parseGLB(outBuffer).json;
 
         const sourceNorm = normalizePhysicsJson(sourceJson);
@@ -939,23 +1123,21 @@
         const nodes = json.nodes || [];
         const meshes = json.meshes || [];
 
-        // Key per-node entries by `name#occurrence` so duplicate names
-        // (jointSpaceA / jointSpaceB) round-trip without entries colliding.
+        // Key per-node entries by `srcIdx:<n>` so nameless and
+        // duplicate-named nodes survive the diff. On the source side
+        // we use the node's own position in `json.nodes`; on the
+        // exported side we read `node.extras.__gltfPhysicsSrcNodeIdx`
+        // planted during capture, which equals that source position —
+        // so source and export end up with the same key.
         const perNode = new Map();
-        const seen = new Map();
-        nodes.forEach(function (n) {
+        nodes.forEach(function (n, i) {
             const ext = n && n.extensions && n.extensions.KHR_physics_rigid_bodies;
-            if (!ext || !n.name) return;
-            const occ = seen.get(n.name) || 0;
-            seen.set(n.name, occ + 1);
+            if (!ext) return;
             const cloned = JSON.parse(JSON.stringify(ext));
-            indexRefsToNames(cloned, nodes, meshes);
-            // Babylon's GLTF2Export drops mesh names but preserves node names,
-            // so meshName diverges between source and export. Drop it and
-            // compare only via the owning-node name, which survives.
-            stripMeshName(cloned.collider && cloned.collider.geometry);
-            stripMeshName(cloned.trigger && cloned.trigger.geometry);
-            perNode.set(n.name + '#' + occ, cloned);
+            canonicalizeRefsForDiff(cloned, nodes, meshes);
+            const tagged = n.extras && n.extras[SRC_NODE_TAG];
+            const srcIdx = typeof tagged === 'number' ? tagged : i;
+            perNode.set('srcIdx:' + srcIdx, cloned);
         });
 
         return {
@@ -967,8 +1149,45 @@
         };
     }
 
-    function stripMeshName(geometry) {
-        if (geometry) delete geometry.meshName;
+    // Resolve every cross-reference inside a per-node block to a CANONICAL
+    // source-node index so source and exported compare equal regardless of
+    // Babylon renumbering nodes, reordering same-named siblings, or
+    // auto-naming previously-nameless nodes. Source nodes use their own
+    // position; exported nodes carry the original position in
+    // node.extras.__gltfPhysicsSrcNodeIdx. Mesh references are canonicalized
+    // through the owning node's source index (a collision-only mesh with no
+    // owner stays null on the source side and is simply absent on the
+    // exported side, surfacing the real "mesh dropped on export"
+    // limitation).
+    function canonicalizeRefsForDiff(block, nodes, meshes) {
+        if (block.joint && typeof block.joint.connectedNode === 'number') {
+            block.joint.connectedNodeCanonical = canonicalNodeId(nodes, block.joint.connectedNode);
+            delete block.joint.connectedNode;
+        }
+        canonicalizeGeometryRefsForDiff(block.collider && block.collider.geometry, nodes);
+        canonicalizeGeometryRefsForDiff(block.trigger && block.trigger.geometry, nodes);
+    }
+
+    function canonicalNodeId(nodes, idx) {
+        const node = nodes[idx];
+        if (!node) return null;
+        if (node.extras && typeof node.extras[SRC_NODE_TAG] === 'number') {
+            return node.extras[SRC_NODE_TAG];
+        }
+        return idx;
+    }
+
+    function canonicalizeGeometryRefsForDiff(geometry, nodes) {
+        if (!geometry) return;
+        if (typeof geometry.node === 'number') {
+            geometry.nodeCanonical = canonicalNodeId(nodes, geometry.node);
+            delete geometry.node;
+        }
+        if (typeof geometry.mesh === 'number') {
+            const ownerIdx = nodes.findIndex(function (n) { return n && n.mesh === geometry.mesh; });
+            geometry.meshOwnerCanonical = ownerIdx >= 0 ? canonicalNodeId(nodes, ownerIdx) : null;
+            delete geometry.mesh;
+        }
     }
 
     function diffArray(label, a, b, diffs) {
@@ -1036,6 +1255,7 @@
     BABYLON.GLTFPhysicsExport = {
         snapshot: snapshot,
         reset: reset,
+        appendTaggedAsync: appendTaggedAsync,
         captureLoadedAsync: captureLoadedAsync,
         captureProgrammatic: captureProgrammatic,
         captureProgrammaticJoints: captureProgrammaticJoints,
