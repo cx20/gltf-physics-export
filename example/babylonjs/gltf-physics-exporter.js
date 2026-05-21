@@ -77,6 +77,118 @@
         return parseGLB(arrayBuffer).json;
     }
 
+    // Resolve every glTF buffer to a Uint8Array. For .glb the single
+    // buffer is the embedded BIN chunk; for .gltf the buffers reference
+    // external .bin files (or inline data: URIs). Only called when a
+    // collider/trigger references a mesh, so most loads never fetch
+    // binary at all.
+    async function fetchSourceBinaries(sourceUrl, json) {
+        const slash = sourceUrl.lastIndexOf('/');
+        const rootUrl = sourceUrl.substring(0, slash + 1);
+        const isGltf = /\.gltf(\?.*)?$/i.test(sourceUrl);
+        let glbBin = null;
+        if (!isGltf) {
+            const resp = await fetch(sourceUrl);
+            if (!resp.ok) throw new Error('fetchSourceBinaries: fetch failed: ' + resp.status);
+            glbBin = parseGLB(await resp.arrayBuffer()).bin;
+        }
+        const buffers = json.buffers || [];
+        const binaries = [];
+        for (let i = 0; i < buffers.length; i++) {
+            const buf = buffers[i];
+            if (!buf.uri) {
+                binaries[i] = glbBin || new Uint8Array(0);
+            } else if (/^data:/i.test(buf.uri)) {
+                binaries[i] = dataUriToUint8(buf.uri);
+            } else {
+                const binResp = await fetch(rootUrl + buf.uri);
+                if (!binResp.ok) throw new Error('fetchSourceBinaries: bin fetch failed: ' + binResp.status);
+                binaries[i] = new Uint8Array(await binResp.arrayBuffer());
+            }
+        }
+        return binaries;
+    }
+
+    function dataUriToUint8(uri) {
+        const comma = uri.indexOf(',');
+        const meta = uri.substring(0, comma);
+        const data = uri.substring(comma + 1);
+        if (/;base64/i.test(meta)) {
+            const bin = atob(data);
+            const out = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+            return out;
+        }
+        return new TextEncoder().encode(decodeURIComponent(data));
+    }
+
+    // Build a self-contained bundle of geometry for every mesh referenced
+    // by a collider/trigger. Indices are rebased to start at 0 within the
+    // bundle; the binary for each bufferView is sliced out so the inject
+    // step can append it to the exported BIN. Used to re-add collider
+    // meshes that Babylon drops on export (collision-only meshes are
+    // disposed after shape construction; skinned-mesh owners can lose
+    // their mesh ref on re-serialize).
+    function captureColliderMeshGeometry(json, binaries, colliderMeshIdx) {
+        const bundle = { bySrcMesh: {}, meshes: [], accessors: [], bufferViews: [], binaryParts: [] };
+        const bvMap = new Map();
+
+        function localBufferView(srcBvIdx) {
+            if (bvMap.has(srcBvIdx)) return bvMap.get(srcBvIdx);
+            const srcBv = (json.bufferViews || [])[srcBvIdx];
+            if (!srcBv) return null;
+            const buffer = binaries[srcBv.buffer] || new Uint8Array(0);
+            const offset = srcBv.byteOffset || 0;
+            const slice = buffer.slice(offset, offset + srcBv.byteLength);
+            const localBv = { byteLength: srcBv.byteLength };
+            if (srcBv.byteStride != null) localBv.byteStride = srcBv.byteStride;
+            if (srcBv.target != null) localBv.target = srcBv.target;
+            const localIdx = bundle.bufferViews.length;
+            bundle.bufferViews.push(localBv);
+            bundle.binaryParts.push(slice);
+            bvMap.set(srcBvIdx, localIdx);
+            return localIdx;
+        }
+        function localAccessor(srcAccIdx) {
+            const srcAcc = (json.accessors || [])[srcAccIdx];
+            if (!srcAcc) return null;
+            const localAcc = JSON.parse(JSON.stringify(srcAcc));
+            if (typeof srcAcc.bufferView === 'number') {
+                const lbv = localBufferView(srcAcc.bufferView);
+                if (lbv == null) { delete localAcc.bufferView; } else { localAcc.bufferView = lbv; }
+            }
+            bundle.accessors.push(localAcc);
+            return bundle.accessors.length - 1;
+        }
+
+        colliderMeshIdx.forEach(function (srcMeshIdx) {
+            const srcMesh = (json.meshes || [])[srcMeshIdx];
+            if (!srcMesh) return;
+            const localMesh = { primitives: [] };
+            if (srcMesh.name) localMesh.name = srcMesh.name;
+            (srcMesh.primitives || []).forEach(function (prim) {
+                const localPrim = {};
+                if (prim.attributes) {
+                    localPrim.attributes = {};
+                    Object.keys(prim.attributes).forEach(function (attr) {
+                        const la = localAccessor(prim.attributes[attr]);
+                        if (la != null) localPrim.attributes[attr] = la;
+                    });
+                }
+                if (typeof prim.indices === 'number') {
+                    const li = localAccessor(prim.indices);
+                    if (li != null) localPrim.indices = li;
+                }
+                if (prim.mode != null) localPrim.mode = prim.mode;
+                // Collider meshes don't need materials.
+                localMesh.primitives.push(localPrim);
+            });
+            bundle.bySrcMesh[srcMeshIdx] = bundle.meshes.length;
+            bundle.meshes.push(localMesh);
+        });
+        return bundle;
+    }
+
     // Stable per-node identity tag. We plant `node.extras[SRC_NODE_TAG] =
     // <source index>` in the source glTF before Babylon loads it (see
     // appendTaggedAsync). Babylon's glTF loader copies node.extras into
@@ -188,6 +300,25 @@
             }
         });
 
+        // Capture geometry for every mesh referenced by a collider/trigger
+        // so the inject step can re-add the ones Babylon drops. Only fetch
+        // the binary buffers when such references actually exist.
+        const colliderMeshIdx = new Set();
+        nodes.forEach(function (node) {
+            const ext = node && node.extensions && node.extensions.KHR_physics_rigid_bodies;
+            if (!ext) return;
+            [ext.collider, ext.trigger].forEach(function (c) {
+                if (c && c.geometry && typeof c.geometry.mesh === 'number') {
+                    colliderMeshIdx.add(c.geometry.mesh);
+                }
+            });
+        });
+        let colliderMeshBundle = null;
+        if (colliderMeshIdx.size > 0) {
+            const binaries = await fetchSourceBinaries(sourceUrl, json);
+            colliderMeshBundle = captureColliderMeshGeometry(json, binaries, colliderMeshIdx);
+        }
+
         const captured = {
             shapes: implicit && Array.isArray(implicit.shapes)
                 ? JSON.parse(JSON.stringify(implicit.shapes))
@@ -203,7 +334,8 @@
                 : [],
             byName: byName,
             perNode: perNode,
-            srcMeshOwners: srcMeshOwners
+            srcMeshOwners: srcMeshOwners,
+            colliderMeshBundle: colliderMeshBundle
         };
 
         scene.metadata = scene.metadata || {};
@@ -415,10 +547,14 @@
             }
 
             const arrayBuffer = await fileMap[glbName].arrayBuffer();
-            const { json, bin } = parseGLB(arrayBuffer);
+            const parsed = parseGLB(arrayBuffer);
+            const json = parsed.json;
+            let bin = parsed.bin;
 
             if (captured) {
-                injectCapturedExtensions(json, captured);
+                // May grow the BIN (re-injected collider meshes), so take
+                // the returned buffer.
+                bin = injectCapturedExtensions(json, captured, bin) || bin;
             } else {
                 injectPhysicsExtensions(json, derived);
             }
@@ -709,7 +845,8 @@
 
     // --- glTF JSON injection (captured / loaded scenes) ---
 
-    function injectCapturedExtensions(json, captured) {
+    function injectCapturedExtensions(json, captured, bin) {
+        let workingBin = bin;
         const used = new Set(json.extensionsUsed || []);
         used.add('KHR_implicit_shapes');
         used.add('KHR_physics_rigid_bodies');
@@ -733,7 +870,7 @@
         json.extensions.KHR_physics_rigid_bodies = rigid;
 
         if (!Array.isArray(json.nodes)) {
-            return;
+            return workingBin;
         }
 
         // PRIMARY mapping: source node index -> exported node index, read
@@ -781,6 +918,32 @@
             }
         });
 
+        // Re-inject collider/trigger meshes that Babylon dropped. Collect
+        // every source mesh referenced by a captured collider/trigger, and
+        // for those the owner-node mapping above could NOT resolve (the
+        // mesh isn't present on any exported node — collision-only meshes,
+        // or skinned-mesh owners whose mesh ref Babylon moved), append the
+        // captured geometry to the exported glTF + BIN and map srcMesh ->
+        // the new mesh index.
+        if (captured.colliderMeshBundle) {
+            const needInject = new Set();
+            (captured.perNode || []).forEach(function (entry) {
+                [entry.block.collider, entry.block.trigger].forEach(function (c) {
+                    if (c && c.geometry && typeof c.geometry.meshSrcIdx === 'number'
+                        && !srcMeshToExportedIdx.has(c.geometry.meshSrcIdx)) {
+                        needInject.add(c.geometry.meshSrcIdx);
+                    }
+                });
+            });
+            if (needInject.size > 0) {
+                const res = injectColliderMeshes(json, workingBin, captured.colliderMeshBundle, needInject);
+                workingBin = res.bin;
+                res.srcMeshToExportedMesh.forEach(function (expIdx, srcIdx) {
+                    srcMeshToExportedIdx.set(srcIdx, expIdx);
+                });
+            }
+        }
+
         const resolveCtx = {
             srcNodeToExportedIdx: srcNodeToExportedIdx,
             srcMeshToExportedIdx: srcMeshToExportedIdx,
@@ -823,6 +986,98 @@
                 node.extensions.KHR_physics_rigid_bodies = cloned;
             });
         }
+
+        return workingBin;
+    }
+
+    // Append the geometry for the requested source meshes (from the
+    // capture-time bundle) to the exported glTF and its BIN. Returns the
+    // grown BIN plus a srcMeshIdx -> exported mesh index map. Only the
+    // bufferViews / accessors actually used by the requested meshes are
+    // emitted, each appended to the buffer at a 4-byte aligned offset.
+    function injectColliderMeshes(json, bin, bundle, neededSrcMeshSet) {
+        json.buffers = json.buffers || [];
+        if (json.buffers.length === 0) json.buffers.push({ byteLength: 0 });
+        json.bufferViews = json.bufferViews || [];
+        json.accessors = json.accessors || [];
+        json.meshes = json.meshes || [];
+
+        let curBin = bin || new Uint8Array(0);
+        const appended = [];
+        let writeOffset = curBin.byteLength;
+
+        const bvLocalToExported = new Map();
+        const accLocalToExported = new Map();
+        const srcMeshToExportedMesh = new Map();
+
+        function ensureBufferView(localIdx) {
+            if (bvLocalToExported.has(localIdx)) return bvLocalToExported.get(localIdx);
+            const localBv = bundle.bufferViews[localIdx];
+            const slice = bundle.binaryParts[localIdx];
+            const pad = (4 - (writeOffset % 4)) % 4;
+            if (pad) { appended.push(new Uint8Array(pad)); writeOffset += pad; }
+            const byteOffset = writeOffset;
+            appended.push(slice);
+            writeOffset += slice.byteLength;
+            const expBv = { buffer: 0, byteOffset: byteOffset, byteLength: localBv.byteLength };
+            if (localBv.byteStride != null) expBv.byteStride = localBv.byteStride;
+            if (localBv.target != null) expBv.target = localBv.target;
+            const expIdx = json.bufferViews.length;
+            json.bufferViews.push(expBv);
+            bvLocalToExported.set(localIdx, expIdx);
+            return expIdx;
+        }
+        function ensureAccessor(localIdx) {
+            if (accLocalToExported.has(localIdx)) return accLocalToExported.get(localIdx);
+            const localAcc = bundle.accessors[localIdx];
+            const expAcc = JSON.parse(JSON.stringify(localAcc));
+            if (typeof localAcc.bufferView === 'number') {
+                expAcc.bufferView = ensureBufferView(localAcc.bufferView);
+            }
+            const expIdx = json.accessors.length;
+            json.accessors.push(expAcc);
+            accLocalToExported.set(localIdx, expIdx);
+            return expIdx;
+        }
+
+        neededSrcMeshSet.forEach(function (srcMeshIdx) {
+            const localMeshIdx = bundle.bySrcMesh[srcMeshIdx];
+            if (localMeshIdx == null) return;
+            const localMesh = bundle.meshes[localMeshIdx];
+            const expMesh = { primitives: [] };
+            if (localMesh.name) expMesh.name = localMesh.name;
+            (localMesh.primitives || []).forEach(function (prim) {
+                const expPrim = {};
+                if (prim.attributes) {
+                    expPrim.attributes = {};
+                    Object.keys(prim.attributes).forEach(function (attr) {
+                        expPrim.attributes[attr] = ensureAccessor(prim.attributes[attr]);
+                    });
+                }
+                if (typeof prim.indices === 'number') {
+                    expPrim.indices = ensureAccessor(prim.indices);
+                }
+                if (prim.mode != null) expPrim.mode = prim.mode;
+                expMesh.primitives.push(expPrim);
+            });
+            const expMeshIdx = json.meshes.length;
+            json.meshes.push(expMesh);
+            srcMeshToExportedMesh.set(srcMeshIdx, expMeshIdx);
+        });
+
+        if (appended.length > 0) {
+            const newBin = new Uint8Array(writeOffset);
+            newBin.set(curBin, 0);
+            let p = curBin.byteLength;
+            appended.forEach(function (part) {
+                newBin.set(part, p);
+                p += part.byteLength;
+            });
+            curBin = newBin;
+        }
+        json.buffers[0].byteLength = curBin.byteLength;
+
+        return { bin: curBin, srcMeshToExportedMesh: srcMeshToExportedMesh };
     }
 
     // Mapping for resource references inside a KHR_physics_rigid_bodies block.
@@ -1184,8 +1439,14 @@
             delete geometry.node;
         }
         if (typeof geometry.mesh === 'number') {
-            const ownerIdx = nodes.findIndex(function (n) { return n && n.mesh === geometry.mesh; });
-            geometry.meshOwnerCanonical = ownerIdx >= 0 ? canonicalNodeId(nodes, ownerIdx) : null;
+            // Compare mesh references by PRESENCE, not identity. The exact
+            // mesh geometry is preserved by the exporter (owner-node
+            // resolution or re-injection of the captured geometry), but the
+            // mesh INDEX and its owning node differ between source and
+            // export — and a re-injected collision mesh has no owner at all.
+            // Presence keeps a dropped collider (no mesh on export) failing
+            // while a correctly round-tripped one passes.
+            geometry.meshPresent = true;
             delete geometry.mesh;
         }
     }
