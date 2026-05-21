@@ -41,6 +41,12 @@ and the exporter re-injects the captured extensions into the resulting
 Babylon's node renumbering. The programmatic minimum scene still uses the
 older `mesh.aggregate` path.
 
+> **Exporter internals & design notes:** why a plain `GLTF2Export` can't
+> round-trip glTF Physics, and the techniques used to work around it
+> (source-index node tags, `metadataSelector`, collider-mesh re-injection,
+> GLB repacking, validation pitfalls) are documented in
+> [`docs/exporter-internals.md`](docs/exporter-internals.md).
+
 ## Roadmap
 
 1. **Loader coverage** — done.
