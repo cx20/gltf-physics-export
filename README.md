@@ -83,6 +83,34 @@ older `mesh.aggregate` path.
    sample, exports it via `GLTFPhysicsExport`, and diffs the resulting
    physics extension blocks against the source for semantic equivalence.
 
+## Known limitations / remaining tasks
+
+The **programmatic export path** (`collectPhysicsData` →
+`injectPhysicsExtensions`, used for scenes built with `PhysicsAggregate`
+rather than loaded from a `.glb`) does not yet cover everything:
+
+- **Constraint / joint export** — joints created imperatively with
+  `body.addConstraint(...)` (e.g. `HingeConstraint`, `Physics6DoFConstraint`)
+  are **not** exported. Today only the captured/loaded path and the
+  declarative `scene.metadata.__pendingPhysicsJoints` form (see
+  `captureProgrammaticJoints`) produce
+  `KHR_physics_rigid_bodies.physicsJoints`. Babylon exposes no public API to
+  enumerate a scene's constraints, so auto-discovery would have to read
+  engine internals. **Remaining task.**
+- **Mesh / convex-hull colliders** — `describeShape` only emits implicit
+  shapes (box / sphere / capsule / cylinder). A `PhysicsShapeType.MESH` or
+  `CONVEX_HULL` body is skipped (logged as *"unsupported physics shape"*), so
+  e.g. a `MeshBuilder.CreateGround` floor with a `MESH` collider exports with
+  no collider and other bodies fall through it. Emitting
+  `collider.geometry.mesh` for these is a **remaining task.**
+
+> Note: runtime control logic is application code and cannot round-trip
+> through glTF. A scene whose motion comes from per-frame script (e.g.
+> `applyAngularImpulse` in `onBeforeRenderObservable`, animation callbacks)
+> exports only the physics *data* (bodies, shapes, joints, materials) — the
+> driving logic is not part of the file, so a script-driven walking rig
+> re-imports as a static articulated body, not a moving one.
+
 ## Repository layout
 
 ```
