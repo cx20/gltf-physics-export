@@ -129,47 +129,16 @@ function setDetails(name, diffs, errorMessage) {
     row.details.appendChild(pre);
 }
 
-// The cx20 rigid-body loader dereferences `gltf.extensions.KHR_implicit_shapes`
-// and `gltf.extensions.KHR_physics_rigid_bodies` whenever those names appear
-// in `extensionsUsed`. Some upstream tests (mesh-only colliders, no shared
-// materials/filters/joints) skip the top-level block entirely, which crashes
-// the loader. Pre-fetch the .gltf, splice in empty placeholders, and hand the
-// patched JSON to SceneLoader as a File so the .bin URIs still resolve
-// against the original rootUrl.
-async function appendSceneAsync(entry, scene) {
-    const slash = entry.url.lastIndexOf('/');
-    const rootUrl = entry.url.substring(0, slash + 1);
-    const fileName = entry.url.substring(slash + 1);
-
-    if (/\.glb(\?.*)?$/i.test(fileName)) {
-        await BABYLON.SceneLoader.AppendAsync(rootUrl, fileName, scene);
-        return;
-    }
-
-    const resp = await fetch(entry.url);
-    if (!resp.ok) throw new Error('fetch ' + entry.url + ' failed: ' + resp.status);
-    const json = await resp.json();
-    const used = json.extensionsUsed || [];
-    if (used.indexOf('KHR_implicit_shapes') >= 0 || used.indexOf('KHR_physics_rigid_bodies') >= 0) {
-        json.extensions = json.extensions || {};
-        if (used.indexOf('KHR_implicit_shapes') >= 0 && !json.extensions.KHR_implicit_shapes) {
-            json.extensions.KHR_implicit_shapes = { shapes: [] };
-        }
-        if (used.indexOf('KHR_physics_rigid_bodies') >= 0 && !json.extensions.KHR_physics_rigid_bodies) {
-            json.extensions.KHR_physics_rigid_bodies = {};
-        }
-    }
-    const blob = new Blob([JSON.stringify(json)], { type: 'model/gltf+json' });
-    const file = new File([blob], fileName, { type: 'model/gltf+json' });
-    await BABYLON.SceneLoader.AppendAsync(rootUrl, file, scene, null, '.gltf');
-}
-
 async function runOne(entry, engine) {
     const scene = new BABYLON.Scene(engine);
     try {
         const hk = new BABYLON.HavokPlugin();
         scene.enablePhysics(new BABYLON.Vector3(0, -9.8, 0), hk);
-        await appendSceneAsync(entry, scene);
+        // appendTaggedAsync stamps every source node with its index and
+        // patches missing top-level extension blocks before handing the
+        // patched content to SceneLoader, so physics round-trips even for
+        // nameless / duplicate-named nodes.
+        await BABYLON.GLTFPhysicsExport.appendTaggedAsync(scene, entry.url);
         await BABYLON.GLTFPhysicsExport.captureLoadedAsync(scene, entry.url);
         const result = await BABYLON.GLTFPhysicsExport.validateRoundTripAsync(scene, entry.url);
         if (result.pass) {

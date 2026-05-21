@@ -88,7 +88,7 @@ async function createScene() {
     dirLight.position = new BABYLON.Vector3(12, 16, 10);
     dirLight.intensity = 0.8;
 
-    await BABYLON.SceneLoader.AppendAsync(MODEL_ROOT, MODEL_FILE, scene);
+    await BABYLON.GLTFPhysicsExport.appendTaggedAsync(scene, MODEL_ROOT + MODEL_FILE);
     await BABYLON.GLTFPhysicsExport.captureLoadedAsync(scene, MODEL_ROOT + MODEL_FILE);
     if (BABYLON.GLTFPhysicsControlPanel) {
         BABYLON.GLTFPhysicsControlPanel.init(scene, { exportName: MODEL_FILE.replace(/\.glb$/i, '') });
