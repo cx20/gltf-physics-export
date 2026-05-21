@@ -122,67 +122,113 @@
         return new TextEncoder().encode(decodeURIComponent(data));
     }
 
-    // Build a self-contained bundle of geometry for every mesh referenced
-    // by a collider/trigger. Indices are rebased to start at 0 within the
-    // bundle; the binary for each bufferView is sliced out so the inject
-    // step can append it to the exported BIN. Used to re-add collider
-    // meshes that Babylon drops on export (collision-only meshes are
-    // disposed after shape construction; skinned-mesh owners can lose
-    // their mesh ref on re-serialize).
+    // glTF accessor component sizes / counts.
+    const COMP_SIZE = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+    const TYPE_COMPONENTS = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT2: 4, MAT3: 9, MAT4: 16 };
+
+    // Decode an accessor to a flat JS number array (handles byteStride and
+    // all component types). Used to merge collider primitives.
+    function readAccessorNumbers(json, binaries, accIdx) {
+        const acc = (json.accessors || [])[accIdx];
+        if (!acc || typeof acc.bufferView !== 'number') return [];
+        const bv = json.bufferViews[acc.bufferView];
+        const buffer = binaries[bv.buffer];
+        if (!buffer) return [];
+        const numComp = TYPE_COMPONENTS[acc.type] || 1;
+        const compSize = COMP_SIZE[acc.componentType] || 4;
+        const elemSize = numComp * compSize;
+        const stride = bv.byteStride || elemSize;
+        const base = (bv.byteOffset || 0) + (acc.byteOffset || 0);
+        const dv = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+        const out = [];
+        for (let i = 0; i < acc.count; i++) {
+            const elemOff = base + i * stride;
+            for (let c = 0; c < numComp; c++) {
+                const off = elemOff + c * compSize;
+                let v;
+                switch (acc.componentType) {
+                    case 5126: v = dv.getFloat32(off, true); break;
+                    case 5125: v = dv.getUint32(off, true); break;
+                    case 5123: v = dv.getUint16(off, true); break;
+                    case 5122: v = dv.getInt16(off, true); break;
+                    case 5121: v = dv.getUint8(off); break;
+                    case 5120: v = dv.getInt8(off); break;
+                    default: v = 0;
+                }
+                out.push(v);
+            }
+        }
+        return out;
+    }
+
+    // Build a self-contained bundle of geometry for every mesh referenced by
+    // a collider/trigger. Each source mesh is MERGED into a single primitive
+    // holding only POSITION + indices: physics doesn't need materials,
+    // normals or UVs, and a single primitive sidesteps the rigid-body
+    // loader's trouble building a shape from a multi-primitive orphan mesh
+    // (e.g. WaterWheel's 2-primitive track ramp). The inject step appends the
+    // freshly-encoded binary to the exported BIN. This re-adds collider
+    // meshes Babylon drops on export (collision-only meshes are disposed
+    // after shape construction; multi-primitive owners get split).
     function captureColliderMeshGeometry(json, binaries, colliderMeshIdx) {
         const bundle = { bySrcMesh: {}, meshes: [], accessors: [], bufferViews: [], binaryParts: [] };
-        const bvMap = new Map();
-
-        function localBufferView(srcBvIdx) {
-            if (bvMap.has(srcBvIdx)) return bvMap.get(srcBvIdx);
-            const srcBv = (json.bufferViews || [])[srcBvIdx];
-            if (!srcBv) return null;
-            const buffer = binaries[srcBv.buffer] || new Uint8Array(0);
-            const offset = srcBv.byteOffset || 0;
-            const slice = buffer.slice(offset, offset + srcBv.byteLength);
-            const localBv = { byteLength: srcBv.byteLength };
-            if (srcBv.byteStride != null) localBv.byteStride = srcBv.byteStride;
-            if (srcBv.target != null) localBv.target = srcBv.target;
-            const localIdx = bundle.bufferViews.length;
-            bundle.bufferViews.push(localBv);
-            bundle.binaryParts.push(slice);
-            bvMap.set(srcBvIdx, localIdx);
-            return localIdx;
-        }
-        function localAccessor(srcAccIdx) {
-            const srcAcc = (json.accessors || [])[srcAccIdx];
-            if (!srcAcc) return null;
-            const localAcc = JSON.parse(JSON.stringify(srcAcc));
-            if (typeof srcAcc.bufferView === 'number') {
-                const lbv = localBufferView(srcAcc.bufferView);
-                if (lbv == null) { delete localAcc.bufferView; } else { localAcc.bufferView = lbv; }
-            }
-            bundle.accessors.push(localAcc);
-            return bundle.accessors.length - 1;
-        }
 
         colliderMeshIdx.forEach(function (srcMeshIdx) {
             const srcMesh = (json.meshes || [])[srcMeshIdx];
             if (!srcMesh) return;
-            const localMesh = { primitives: [] };
-            if (srcMesh.name) localMesh.name = srcMesh.name;
+
+            const mergedPos = [];
+            const mergedIdx = [];
+            let vertBase = 0;
             (srcMesh.primitives || []).forEach(function (prim) {
-                const localPrim = {};
-                if (prim.attributes) {
-                    localPrim.attributes = {};
-                    Object.keys(prim.attributes).forEach(function (attr) {
-                        const la = localAccessor(prim.attributes[attr]);
-                        if (la != null) localPrim.attributes[attr] = la;
-                    });
-                }
+                if (!prim.attributes || prim.attributes.POSITION == null) return;
+                const pos = readAccessorNumbers(json, binaries, prim.attributes.POSITION);
+                const vcount = pos.length / 3;
+                let idx;
                 if (typeof prim.indices === 'number') {
-                    const li = localAccessor(prim.indices);
-                    if (li != null) localPrim.indices = li;
+                    idx = readAccessorNumbers(json, binaries, prim.indices);
+                } else {
+                    idx = [];
+                    for (let i = 0; i < vcount; i++) idx.push(i);
                 }
-                if (prim.mode != null) localPrim.mode = prim.mode;
-                // Collider meshes don't need materials.
-                localMesh.primitives.push(localPrim);
+                for (let i = 0; i < pos.length; i++) mergedPos.push(pos[i]);
+                for (let i = 0; i < idx.length; i++) mergedIdx.push(idx[i] + vertBase);
+                vertBase += vcount;
             });
+            if (mergedPos.length === 0) return;
+
+            // Encode POSITION (float32, VEC3) and indices (uint32, SCALAR).
+            const posBytes = new Uint8Array(new Float32Array(mergedPos).buffer);
+            const idxBytes = new Uint8Array(new Uint32Array(mergedIdx).buffer);
+            const min = [Infinity, Infinity, Infinity];
+            const max = [-Infinity, -Infinity, -Infinity];
+            for (let i = 0; i < mergedPos.length; i += 3) {
+                for (let c = 0; c < 3; c++) {
+                    const v = mergedPos[i + c];
+                    if (v < min[c]) min[c] = v;
+                    if (v > max[c]) max[c] = v;
+                }
+            }
+
+            const posBvIdx = bundle.bufferViews.length;
+            bundle.bufferViews.push({ byteLength: posBytes.byteLength, target: 34962 });
+            bundle.binaryParts.push(posBytes);
+            const posAccIdx = bundle.accessors.length;
+            bundle.accessors.push({
+                bufferView: posBvIdx, componentType: 5126, count: mergedPos.length / 3,
+                type: 'VEC3', min: min, max: max
+            });
+
+            const idxBvIdx = bundle.bufferViews.length;
+            bundle.bufferViews.push({ byteLength: idxBytes.byteLength, target: 34963 });
+            bundle.binaryParts.push(idxBytes);
+            const idxAccIdx = bundle.accessors.length;
+            bundle.accessors.push({
+                bufferView: idxBvIdx, componentType: 5125, count: mergedIdx.length, type: 'SCALAR'
+            });
+
+            const localMesh = { primitives: [{ attributes: { POSITION: posAccIdx }, indices: idxAccIdx }] };
+            if (srcMesh.name) localMesh.name = srcMesh.name;
             bundle.bySrcMesh[srcMeshIdx] = bundle.meshes.length;
             bundle.meshes.push(localMesh);
         });
@@ -926,17 +972,24 @@
         // captured geometry to the exported glTF + BIN and map srcMesh ->
         // the new mesh index.
         if (captured.colliderMeshBundle) {
-            const needInject = new Set();
+            // Always re-inject the exact source geometry for EVERY collider /
+            // trigger mesh rather than reusing Babylon's exported render
+            // meshes. Babylon splits multi-primitive meshes (so owner-node
+            // resolution would hand the collider only the first primitive —
+            // e.g. WaterWheel's 2-primitive track ramp, Robot's 2-primitive
+            // head) and disposes collision-only meshes entirely. Re-injecting
+            // guarantees complete, exact collision shapes; the cost is a
+            // little duplicated geometry, which is invisible (physics only).
+            const allColliderMeshes = new Set();
             (captured.perNode || []).forEach(function (entry) {
                 [entry.block.collider, entry.block.trigger].forEach(function (c) {
-                    if (c && c.geometry && typeof c.geometry.meshSrcIdx === 'number'
-                        && !srcMeshToExportedIdx.has(c.geometry.meshSrcIdx)) {
-                        needInject.add(c.geometry.meshSrcIdx);
+                    if (c && c.geometry && typeof c.geometry.meshSrcIdx === 'number') {
+                        allColliderMeshes.add(c.geometry.meshSrcIdx);
                     }
                 });
             });
-            if (needInject.size > 0) {
-                const res = injectColliderMeshes(json, workingBin, captured.colliderMeshBundle, needInject);
+            if (allColliderMeshes.size > 0) {
+                const res = injectColliderMeshes(json, workingBin, captured.colliderMeshBundle, allColliderMeshes);
                 workingBin = res.bin;
                 res.srcMeshToExportedMesh.forEach(function (expIdx, srcIdx) {
                     srcMeshToExportedIdx.set(srcIdx, expIdx);
