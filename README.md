@@ -83,33 +83,45 @@ older `mesh.aggregate` path.
    sample, exports it via `GLTFPhysicsExport`, and diffs the resulting
    physics extension blocks against the source for semantic equivalence.
 
-## Known limitations / remaining tasks
+## Programmatic-export coverage & limitations
 
 The **programmatic export path** (`collectPhysicsData` →
 `injectPhysicsExtensions`, used for scenes built with `PhysicsAggregate`
-rather than loaded from a `.glb`) does not yet cover everything:
+rather than loaded from a `.glb`) now covers:
 
-- **Constraint / joint export** — joints created imperatively with
-  `body.addConstraint(...)` (e.g. `HingeConstraint`, `Physics6DoFConstraint`)
-  are **not** exported. Today only the captured/loaded path and the
-  declarative `scene.metadata.__pendingPhysicsJoints` form (see
-  `captureProgrammaticJoints`) produce
-  `KHR_physics_rigid_bodies.physicsJoints`. Babylon exposes no public API to
-  enumerate a scene's constraints, so auto-discovery would have to read
-  engine internals. **Remaining task.**
-- **Mesh / convex-hull colliders** — `describeShape` only emits implicit
-  shapes (box / sphere / capsule / cylinder). A `PhysicsShapeType.MESH` or
-  `CONVEX_HULL` body is skipped (logged as *"unsupported physics shape"*), so
-  e.g. a `MeshBuilder.CreateGround` floor with a `MESH` collider exports with
-  no collider and other bodies fall through it. Emitting
-  `collider.geometry.mesh` for these is a **remaining task.**
+- **Mesh / convex-hull colliders** — a `PhysicsShapeType.MESH` / `CONVEX_HULL`
+  body exports as `collider.geometry.mesh`, referencing the node's own glTF
+  mesh (so e.g. a `MeshBuilder.CreateGround` floor keeps its collider instead
+  of letting everything fall through). Box / sphere / capsule / cylinder still
+  export as `KHR_implicit_shapes`.
+- **Constraint / joint export with motors** — Babylon exposes no API to
+  enumerate a scene's constraints, so the app registers each joint it wants
+  exported via `GLTFPhysicsExport.registerJoint(scene, spec)`. Each becomes a
+  `KHR_physics_rigid_bodies.physicsJoints` entry (limits + drives) plus a pair
+  of `jointSpaceA` / `jointSpaceB` anchor nodes. A `motor` (target velocity /
+  position, max force, damping) exports as a joint `drive`, so motor-driven
+  mechanisms (a wheel, a wheg walker, the upstream WaterWheel / Robot) keep
+  moving on re-import. `spec`:
+
+  ```js
+  BABYLON.GLTFPhysicsExport.registerJoint(scene, {
+      bodyA: chassisMesh, bodyB: wheelMesh,        // the two rigid-body meshes
+      pivotA: new BABYLON.Vector3(1.2, -0.7, 1.1), // attach point in each body's local space
+      pivotB: BABYLON.Vector3.Zero(),
+      axisA: new BABYLON.Vector3(1, 0, 0),         // hinge axis in each body's local space
+      axisB: new BABYLON.Vector3(1, 0, 0),
+      type: "hinge",                               // free rotation about the axis
+      motor: { targetVelocity: -6, maxForce: 1e6, damping: 100 }
+  });
+  ```
 
 > Note: runtime control logic is application code and cannot round-trip
 > through glTF. A scene whose motion comes from per-frame script (e.g.
 > `applyAngularImpulse` in `onBeforeRenderObservable`, animation callbacks)
-> exports only the physics *data* (bodies, shapes, joints, materials) — the
-> driving logic is not part of the file, so a script-driven walking rig
-> re-imports as a static articulated body, not a moving one.
+> exports only the physics *data* (bodies, shapes, joints + drives,
+> materials) — the driving script is not part of the file. Encode motion as a
+> joint **drive** (a motor, as above), not a per-frame impulse, for it to
+> round-trip.
 
 ## Repository layout
 

@@ -23,6 +23,10 @@
 
     const SNAPSHOT_KEY = '__gltfPhysicsExportSnapshot';
     const CAPTURED_KEY = '__gltfPhysicsCaptured';
+    // Joints registered by the app via registerJoint(scene, spec); Babylon has
+    // no API to enumerate a scene's constraints, so the programmatic export
+    // path reads them from here.
+    const JOINT_REG_KEY = '__gltfPhysicsJointRegs';
 
     const GLB_MAGIC = 0x46546C67;  // 'glTF'
     const GLB_VERSION = 2;
@@ -689,7 +693,8 @@
             }
         });
 
-        return { shapes, materials, collisionFilters, bodies };
+        const joints = (scene.metadata && scene.metadata[JOINT_REG_KEY]) || [];
+        return { shapes, materials, collisionFilters, bodies, joints: joints };
     }
 
     function describeBody(mesh, shapes, materials, collisionFilters, isCompoundChild) {
@@ -986,6 +991,147 @@
             }
             node.extensions = node.extensions || {};
             node.extensions.KHR_physics_rigid_bodies = cloned;
+        });
+
+        injectJoints(json, data.joints);
+    }
+
+    // --- programmatic joint export (registered via registerJoint) ---
+    //
+    // Babylon exposes no API to enumerate a scene's constraints, so the app
+    // registers each joint it wants exported with
+    // GLTFPhysicsExport.registerJoint(scene, spec). At export time each
+    // registration becomes a glTF physics joint: a top-level physicsJoints[]
+    // entry (limits + drives) plus a pair of anchor frame nodes
+    // (jointSpaceA / jointSpaceB) parented under the two bodies, with the
+    // `joint` block on the first anchor — the same shape the upstream
+    // JointTypes samples use, so the rigid-body loader rebuilds the
+    // constraint AND its motor on load.
+    //
+    // spec = {
+    //   bodyA, bodyB,                 // the two rigid-body meshes (matched by name)
+    //   pivotA, pivotB,               // Vector3 attach points in each body's local space
+    //   axisA, axisB,                 // Vector3 hinge axis in each body's local space (default +X)
+    //   type: 'hinge' | '6dof',       // default 'hinge'
+    //   motor: {                      // optional, drives the free axis
+    //     targetVelocity, targetPosition, maxForce, damping, stiffness, mode
+    //   },
+    //   limits, drives,               // advanced: glTF-form arrays for type '6dof'
+    //   enableCollision               // default false
+    // }
+    function registerJoint(scene, spec) {
+        if (!scene || !spec || !spec.bodyA || !spec.bodyB) {
+            console.warn('[GLTFPhysicsExport] registerJoint: spec needs bodyA and bodyB');
+            return;
+        }
+        scene.metadata = scene.metadata || {};
+        const list = scene.metadata[JOINT_REG_KEY] || (scene.metadata[JOINT_REG_KEY] = []);
+        list.push(spec);
+    }
+
+    // Rotation mapping local +X onto the given axis, so an anchor's local X
+    // becomes the joint's primary (free / motorised) axis. Null = no rotation.
+    function quatFromXAxis(axisVec) {
+        const X = new BABYLON.Vector3(1, 0, 0);
+        const t = (axisVec || X).clone();
+        if (t.lengthSquared() < 1e-12) return null;
+        t.normalize();
+        const d = BABYLON.Vector3.Dot(X, t);
+        if (d > 0.999999) return null;                       // already aligned with +X
+        if (d < -0.999999) return BABYLON.Quaternion.RotationAxis(new BABYLON.Vector3(0, 1, 0), Math.PI);
+        const axis = BABYLON.Vector3.Cross(X, t);
+        axis.normalize();
+        return BABYLON.Quaternion.RotationAxis(axis, Math.acos(d));
+    }
+
+    function appendAnchorNode(json, name, pivot, axisVec, parentNode) {
+        const node = { name: name };
+        if (pivot) node.translation = [pivot.x, pivot.y, pivot.z];
+        const q = quatFromXAxis(axisVec);
+        if (q) node.rotation = [q.x, q.y, q.z, q.w];
+        const index = json.nodes.length;
+        json.nodes.push(node);
+        parentNode.children = parentNode.children || [];
+        parentNode.children.push(index);
+        return index;
+    }
+
+    function buildJointDefinition(reg) {
+        // Advanced: caller supplied glTF-form limits / drives directly.
+        if (reg.limits || reg.drives) {
+            const def = { limits: reg.limits || [] };
+            if (reg.drives) def.drives = reg.drives;
+            return def;
+        }
+        // Default 'hinge': the free axis is angular X (index 0) — the anchor's
+        // local X, which appendAnchorNode aligns to axisA/axisB. Lock all
+        // linear axes plus angular Y/Z.
+        const def = {
+            limits: [
+                { linearAxes: [0], min: 0, max: 0 },
+                { linearAxes: [1], min: 0, max: 0 },
+                { linearAxes: [2], min: 0, max: 0 },
+                { angularAxes: [1], min: 0, max: 0 },
+                { angularAxes: [2], min: 0, max: 0 }
+            ]
+        };
+        if (reg.motor) {
+            const m = reg.motor;
+            // The loader applies drives as spring motors: velocityTarget+damping
+            // gives a velocity motor, positionTarget+stiffness a position motor.
+            const drive = {
+                type: 'angular',
+                mode: m.mode === 'force' ? 'force' : 'acceleration',
+                axis: 0,
+                positionTarget: typeof m.targetPosition === 'number' ? m.targetPosition : 0,
+                velocityTarget: typeof m.targetVelocity === 'number' ? m.targetVelocity : 0,
+                stiffness: typeof m.stiffness === 'number' ? m.stiffness : 0,
+                damping: typeof m.damping === 'number' ? m.damping : 100
+            };
+            if (typeof m.maxForce === 'number') drive.maxForce = m.maxForce;
+            def.drives = [drive];
+        }
+        return def;
+    }
+
+    function injectJoints(json, jointRegs) {
+        if (!Array.isArray(jointRegs) || jointRegs.length === 0) return;
+        if (!Array.isArray(json.nodes)) return;
+
+        json.extensions = json.extensions || {};
+        const rigid = json.extensions.KHR_physics_rigid_bodies =
+            json.extensions.KHR_physics_rigid_bodies || {};
+        const physicsJoints = rigid.physicsJoints || (rigid.physicsJoints = []);
+
+        const nodeByName = new Map();
+        json.nodes.forEach(function (n, i) {
+            if (n && n.name && !nodeByName.has(n.name)) nodeByName.set(n.name, i);
+        });
+
+        jointRegs.forEach(function (reg) {
+            const nameA = reg.bodyA && reg.bodyA.name;
+            const nameB = reg.bodyB && reg.bodyB.name;
+            const aIdx = nodeByName.get(nameA);
+            const bIdx = nodeByName.get(nameB);
+            if (typeof aIdx !== 'number' || typeof bIdx !== 'number') {
+                console.warn('[GLTFPhysicsExport] registerJoint: could not resolve bodies', nameA, nameB);
+                return;
+            }
+            const jointIdx = physicsJoints.length;
+            physicsJoints.push(buildJointDefinition(reg));
+
+            const anchorAIdx = appendAnchorNode(json, '__jointSpaceA_' + jointIdx, reg.pivotA, reg.axisA, json.nodes[aIdx]);
+            const anchorBIdx = appendAnchorNode(json, '__jointSpaceB_' + jointIdx, reg.pivotB, reg.axisB, json.nodes[bIdx]);
+
+            json.nodes[anchorAIdx].extensions = {
+                KHR_physics_rigid_bodies: {
+                    joint: {
+                        connectedNode: anchorBIdx,
+                        joint: jointIdx,
+                        enableCollision: !!reg.enableCollision
+                    }
+                }
+            };
         });
     }
 
@@ -1674,6 +1820,7 @@
         captureProgrammatic: captureProgrammatic,
         captureProgrammaticJoints: captureProgrammaticJoints,
         disposeProgrammaticJoints: disposeProgrammaticJoints,
+        registerJoint: registerJoint,
         GLBAsync: GLBAsync,
         validateRoundTripAsync: validateRoundTripAsync
     };
