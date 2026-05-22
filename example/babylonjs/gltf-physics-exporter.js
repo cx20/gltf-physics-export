@@ -600,6 +600,9 @@
         options = options || {};
         const captured = scene.metadata && scene.metadata[CAPTURED_KEY];
         const derived = captured ? null : collectPhysicsData(scene);
+        // Build joint anchor nodes before export so GLTF2Export converts their
+        // coordinates the same way it converts the bodies.
+        const jointBundle = captured ? null : createProgrammaticJointAnchors(scene, derived.joints);
         const restore = applySnapshots(scene);
         try {
             const exportOptions = {
@@ -646,6 +649,7 @@
                 bin = injectCapturedExtensions(json, captured, bin) || bin;
             } else {
                 injectPhysicsExtensions(json, derived);
+                injectProgrammaticJoints(json, jointBundle);
             }
 
             // The __gltfPhysicsSrcNodeIdx tags are an internal staging aid
@@ -663,6 +667,7 @@
             return outBuffer;
         } finally {
             restore();
+            disposeJointAnchors(jointBundle);
         }
     }
 
@@ -992,8 +997,6 @@
             node.extensions = node.extensions || {};
             node.extensions.KHR_physics_rigid_bodies = cloned;
         });
-
-        injectJoints(json, data.joints);
     }
 
     // --- programmatic joint export (registered via registerJoint) ---
@@ -1044,16 +1047,45 @@
         return BABYLON.Quaternion.RotationAxis(axis, Math.acos(d));
     }
 
-    function appendAnchorNode(json, name, pivot, axisVec, parentNode) {
-        const node = { name: name };
-        if (pivot) node.translation = [pivot.x, pivot.y, pivot.z];
-        const q = quatFromXAxis(axisVec);
-        if (q) node.rotation = [q.x, q.y, q.z, q.w];
-        const index = json.nodes.length;
-        json.nodes.push(node);
-        parentNode.children = parentNode.children || [];
-        parentNode.children.push(index);
-        return index;
+    // Build the anchor frame nodes as REAL Babylon nodes BEFORE export, so
+    // GLTF2Export applies the same coordinate-system conversion to them as it
+    // does to the bodies. (Writing anchors straight into the JSON after export
+    // leaves them in Babylon's handedness, which mismatches the converted body
+    // nodes and pulls the joint frames apart.) Tiny invisible boxes are used
+    // rather than bare TransformNodes because some GLTF2Export versions skip
+    // empty transform nodes. Returns a bundle for injectProgrammaticJoints +
+    // disposeJointAnchors. The anchors are named so the inject step can find
+    // their renumbered indices in the exported JSON.
+    function createProgrammaticJointAnchors(scene, regs) {
+        if (!Array.isArray(regs) || regs.length === 0) return null;
+        const anchors = [];
+        const entries = [];
+        regs.forEach(function (reg, i) {
+            if (!reg || !reg.bodyA || !reg.bodyB) return;
+            const aName = '__jointSpaceA_' + i;
+            const bName = '__jointSpaceB_' + i;
+            anchors.push(makeAnchorMesh(scene, aName, reg.bodyA, reg.pivotA, reg.axisA));
+            anchors.push(makeAnchorMesh(scene, bName, reg.bodyB, reg.pivotB, reg.axisB));
+            entries.push({ reg: reg, anchorAName: aName, anchorBName: bName });
+        });
+        return { anchors: anchors, entries: entries };
+    }
+
+    function makeAnchorMesh(scene, name, parentMesh, pivot, axisVec) {
+        const m = BABYLON.MeshBuilder.CreateBox(name, { size: 0.001 }, scene);
+        m.isVisible = false;
+        m.parent = parentMesh;
+        if (pivot) m.position.copyFrom(pivot);
+        // Orient so local +X is the joint's free / motorised axis.
+        m.rotationQuaternion = quatFromXAxis(axisVec) || BABYLON.Quaternion.Identity();
+        return m;
+    }
+
+    function disposeJointAnchors(bundle) {
+        if (!bundle) return;
+        bundle.anchors.forEach(function (a) {
+            try { a.dispose(); } catch (_e) { /* best effort */ }
+        });
     }
 
     function buildJointDefinition(reg) {
@@ -1064,7 +1096,7 @@
             return def;
         }
         // Default 'hinge': the free axis is angular X (index 0) — the anchor's
-        // local X, which appendAnchorNode aligns to axisA/axisB. Lock all
+        // local X, which makeAnchorMesh aligns to axisA / axisB. Lock all
         // linear axes plus angular Y/Z.
         const def = {
             limits: [
@@ -1094,8 +1126,11 @@
         return def;
     }
 
-    function injectJoints(json, jointRegs) {
-        if (!Array.isArray(jointRegs) || jointRegs.length === 0) return;
+    // Post-export: emit the physicsJoints[] entries and write each joint block
+    // onto the (already exported, coordinate-converted) anchor node, matched by
+    // the unique name createProgrammaticJointAnchors gave it.
+    function injectProgrammaticJoints(json, bundle) {
+        if (!bundle || !bundle.entries.length) return;
         if (!Array.isArray(json.nodes)) return;
 
         json.extensions = json.extensions || {};
@@ -1108,28 +1143,23 @@
             if (n && n.name && !nodeByName.has(n.name)) nodeByName.set(n.name, i);
         });
 
-        jointRegs.forEach(function (reg) {
-            const nameA = reg.bodyA && reg.bodyA.name;
-            const nameB = reg.bodyB && reg.bodyB.name;
-            const aIdx = nodeByName.get(nameA);
-            const bIdx = nodeByName.get(nameB);
+        bundle.entries.forEach(function (e) {
+            const aIdx = nodeByName.get(e.anchorAName);
+            const bIdx = nodeByName.get(e.anchorBName);
             if (typeof aIdx !== 'number' || typeof bIdx !== 'number') {
-                console.warn('[GLTFPhysicsExport] registerJoint: could not resolve bodies', nameA, nameB);
+                console.warn('[GLTFPhysicsExport] joint anchor missing in export:', e.anchorAName, e.anchorBName);
                 return;
             }
             const jointIdx = physicsJoints.length;
-            physicsJoints.push(buildJointDefinition(reg));
+            physicsJoints.push(buildJointDefinition(e.reg));
 
-            const anchorAIdx = appendAnchorNode(json, '__jointSpaceA_' + jointIdx, reg.pivotA, reg.axisA, json.nodes[aIdx]);
-            const anchorBIdx = appendAnchorNode(json, '__jointSpaceB_' + jointIdx, reg.pivotB, reg.axisB, json.nodes[bIdx]);
-
-            json.nodes[anchorAIdx].extensions = {
-                KHR_physics_rigid_bodies: {
-                    joint: {
-                        connectedNode: anchorBIdx,
-                        joint: jointIdx,
-                        enableCollision: !!reg.enableCollision
-                    }
+            const anchorANode = json.nodes[aIdx];
+            anchorANode.extensions = anchorANode.extensions || {};
+            anchorANode.extensions.KHR_physics_rigid_bodies = {
+                joint: {
+                    connectedNode: bIdx,
+                    joint: jointIdx,
+                    enableCollision: !!e.reg.enableCollision
                 }
             };
         });
