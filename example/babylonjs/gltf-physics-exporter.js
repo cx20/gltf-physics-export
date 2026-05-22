@@ -33,6 +33,23 @@
         return !!(mesh && (mesh.physicsBody || mesh.aggregate));
     }
 
+    // True when an ancestor also carries physics. The rigid-body loader folds
+    // a parented collider into the ancestor's compound shape (a node with
+    // `motion` plus descendants with `collider`), so such a descendant must
+    // export its collider WITHOUT a motion block. If it kept motion, the
+    // loader would build a SECOND, shapeless dynamic body on the child node
+    // (its shape having gone into the parent's compound) that falls away under
+    // gravity, dragging the child's visual mesh down while the compound
+    // collider stays correctly placed.
+    function hasPhysicsAncestor(mesh) {
+        let p = mesh && mesh.parent;
+        while (p) {
+            if (isPhysicsMesh(p)) return true;
+            p = p.parent;
+        }
+        return false;
+    }
+
     function forEachPhysicsNode(scene, fn) {
         const seen = new Set();
         const visit = function (n) {
@@ -666,7 +683,7 @@
             if (!isPhysicsMesh(mesh)) {
                 return;
             }
-            const body = describeBody(mesh, shapes, materials, collisionFilters);
+            const body = describeBody(mesh, shapes, materials, collisionFilters, hasPhysicsAncestor(mesh));
             if (body) {
                 bodies.set(mesh.name, body);
             }
@@ -675,7 +692,7 @@
         return { shapes, materials, collisionFilters, bodies };
     }
 
-    function describeBody(mesh, shapes, materials, collisionFilters) {
+    function describeBody(mesh, shapes, materials, collisionFilters, isCompoundChild) {
         const shapeSpec = describeShape(mesh);
         if (!shapeSpec) {
             console.warn('[GLTFPhysicsExport] Skipping mesh with unsupported physics shape:', mesh.name);
@@ -700,8 +717,11 @@
         if (filterSpec) {
             body.collider.collisionFilter = pushUnique(collisionFilters, filterSpec);
         }
+        // A node with a physics ancestor contributes only its collider to the
+        // ancestor's compound; emitting motion here would make the loader build
+        // a separate, shapeless dynamic body on the child that falls away.
         const mass = readMass(mesh);
-        if (mass > 0) {
+        if (mass > 0 && !isCompoundChild) {
             body.motion = { mass: mass };
         }
         // mass === 0 → static, no motion block (matches the eoineoineoin convention)
