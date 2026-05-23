@@ -643,6 +643,13 @@
             const json = parsed.json;
             let bin = parsed.bin;
 
+            // GLTF2Export can emit empty/degenerate geometry for runtime-added
+            // decoration meshes (e.g. an environment "custom" mesh with 0
+            // indices). An index accessor with count 0 / a 0-length bufferView
+            // are invalid per the glTF schema and fail validation, so prune
+            // them before we inject physics (which references mesh indices).
+            pruneEmptyGeometry(json);
+
             if (captured) {
                 // May grow the BIN (re-injected collider meshes), so take
                 // the returned buffer.
@@ -678,6 +685,170 @@
                 if (Object.keys(node.extras).length === 0) delete node.extras;
             }
         });
+    }
+
+    // Filter `json[key]` down to the entries whose index is NOT in `removeSet`,
+    // building an old->new index map. `applyRemap(oldToNew)` is invoked with
+    // that map (before the array is swapped in) so the caller can rewrite every
+    // reference into the array. Indices in `removeSet` must already be
+    // unreferenced by anything `applyRemap` does not delete.
+    function compactArray(json, key, removeSet, applyRemap) {
+        const arr = json[key] || [];
+        const oldToNew = new Map();
+        const next = [];
+        arr.forEach(function (item, i) {
+            if (removeSet.has(i)) return;
+            oldToNew.set(i, next.length);
+            next.push(item);
+        });
+        applyRemap(oldToNew);
+        json[key] = next;
+    }
+
+    // Drop empty/degenerate geometry that Babylon's GLTF2Export can emit for
+    // runtime-added meshes (an environment "custom" mesh exports as a primitive
+    // whose index accessor has count 0, backed by a 0-length bufferView). Both
+    // are invalid per the glTF schema (accessor.count / bufferView.byteLength
+    // must be >= 1) and fail the glTF Validator, even though the primitive draws
+    // nothing. We drop the empty primitive, detach the now-empty mesh from its
+    // node, and sweep the accessors / bufferViews it orphaned. The BIN is left
+    // untouched: a removed bufferView simply leaves an unreferenced (legal) gap
+    // in the buffer, so no offsets need to move. Runs before injection so the
+    // physics blocks reference the already-compacted mesh indices.
+    function pruneEmptyGeometry(json) {
+        if (!Array.isArray(json.meshes)) return;
+        const accessors = json.accessors || [];
+        const bufferViews = json.bufferViews || [];
+
+        function accessorIsEmpty(ai) {
+            const a = accessors[ai];
+            if (!a) return true;
+            if (a.sparse) return false; // sparse accessors are valid with a 0-length / absent base
+            if (a.count === 0) return true;
+            if (typeof a.bufferView === 'number') {
+                const bv = bufferViews[a.bufferView];
+                if (bv && bv.byteLength === 0) return true;
+            }
+            return false;
+        }
+
+        // 1. Drop degenerate primitives (empty indices or empty POSITION) and
+        //    remember every accessor they referenced as a sweep candidate.
+        const orphanAcc = new Set();
+        let removedPrimCount = 0;
+        json.meshes.forEach(function (mesh) {
+            if (!mesh || !Array.isArray(mesh.primitives)) return;
+            mesh.primitives = mesh.primitives.filter(function (prim) {
+                const emptyIdx = typeof prim.indices === 'number' && accessorIsEmpty(prim.indices);
+                const pos = prim.attributes && prim.attributes.POSITION;
+                const emptyPos = typeof pos === 'number' && accessorIsEmpty(pos);
+                if (!emptyIdx && !emptyPos) return true;
+                removedPrimCount++;
+                if (typeof prim.indices === 'number') orphanAcc.add(prim.indices);
+                if (prim.attributes) {
+                    Object.keys(prim.attributes).forEach(function (k) { orphanAcc.add(prim.attributes[k]); });
+                }
+                (prim.targets || []).forEach(function (t) {
+                    Object.keys(t).forEach(function (k) { orphanAcc.add(t[k]); });
+                });
+                return false;
+            });
+        });
+        if (removedPrimCount === 0) return;
+
+        // 2. Remove meshes left with no primitives and detach them from nodes.
+        const meshRemove = new Set();
+        json.meshes.forEach(function (mesh, mi) {
+            if (mesh && (!mesh.primitives || mesh.primitives.length === 0)) meshRemove.add(mi);
+        });
+        if (meshRemove.size) {
+            compactArray(json, 'meshes', meshRemove, function (oldToNew) {
+                (json.nodes || []).forEach(function (node) {
+                    if (!node || typeof node.mesh !== 'number') return;
+                    if (meshRemove.has(node.mesh)) delete node.mesh;
+                    else node.mesh = oldToNew.get(node.mesh);
+                });
+            });
+        }
+
+        // 3. Sweep orphaned accessors (only those no surviving primitive,
+        //    skin or animation still references).
+        const accUsed = new Set();
+        function useAcc(ai) { if (typeof ai === 'number') accUsed.add(ai); }
+        (json.meshes || []).forEach(function (m) {
+            (m.primitives || []).forEach(function (p) {
+                useAcc(p.indices);
+                if (p.attributes) Object.keys(p.attributes).forEach(function (k) { useAcc(p.attributes[k]); });
+                (p.targets || []).forEach(function (t) { Object.keys(t).forEach(function (k) { useAcc(t[k]); }); });
+            });
+        });
+        (json.skins || []).forEach(function (s) { useAcc(s.inverseBindMatrices); });
+        (json.animations || []).forEach(function (a) {
+            (a.samplers || []).forEach(function (s) { useAcc(s.input); useAcc(s.output); });
+        });
+
+        const accRemove = new Set();
+        orphanAcc.forEach(function (ai) { if (!accUsed.has(ai)) accRemove.add(ai); });
+
+        // bufferViews the removed accessors point at become sweep candidates.
+        const orphanBv = new Set();
+        accRemove.forEach(function (ai) {
+            const a = accessors[ai];
+            if (a && typeof a.bufferView === 'number') orphanBv.add(a.bufferView);
+        });
+
+        if (accRemove.size) {
+            compactArray(json, 'accessors', accRemove, function (oldToNew) {
+                const remap = function (ai) { return typeof ai === 'number' ? oldToNew.get(ai) : ai; };
+                (json.meshes || []).forEach(function (m) {
+                    (m.primitives || []).forEach(function (p) {
+                        if (typeof p.indices === 'number') p.indices = remap(p.indices);
+                        if (p.attributes) Object.keys(p.attributes).forEach(function (k) { p.attributes[k] = remap(p.attributes[k]); });
+                        (p.targets || []).forEach(function (t) { Object.keys(t).forEach(function (k) { t[k] = remap(t[k]); }); });
+                    });
+                });
+                (json.skins || []).forEach(function (s) {
+                    if (typeof s.inverseBindMatrices === 'number') s.inverseBindMatrices = remap(s.inverseBindMatrices);
+                });
+                (json.animations || []).forEach(function (a) {
+                    (a.samplers || []).forEach(function (s) { s.input = remap(s.input); s.output = remap(s.output); });
+                });
+            });
+        }
+
+        // 4. Sweep bufferViews orphaned by removed accessors (only those no
+        //    surviving accessor or image still references). The BIN bytes stay
+        //    in place; removed views just leave unreferenced gaps.
+        const bvUsed = new Set();
+        (json.accessors || []).forEach(function (a) {
+            if (a && typeof a.bufferView === 'number') bvUsed.add(a.bufferView);
+            if (a && a.sparse) {
+                if (a.sparse.indices && typeof a.sparse.indices.bufferView === 'number') bvUsed.add(a.sparse.indices.bufferView);
+                if (a.sparse.values && typeof a.sparse.values.bufferView === 'number') bvUsed.add(a.sparse.values.bufferView);
+            }
+        });
+        (json.images || []).forEach(function (im) { if (im && typeof im.bufferView === 'number') bvUsed.add(im.bufferView); });
+
+        const bvRemove = new Set();
+        orphanBv.forEach(function (bi) { if (!bvUsed.has(bi)) bvRemove.add(bi); });
+
+        if (bvRemove.size) {
+            compactArray(json, 'bufferViews', bvRemove, function (oldToNew) {
+                const remap = function (bi) { return typeof bi === 'number' ? oldToNew.get(bi) : bi; };
+                (json.accessors || []).forEach(function (a) {
+                    if (a && typeof a.bufferView === 'number') a.bufferView = remap(a.bufferView);
+                    if (a && a.sparse) {
+                        if (a.sparse.indices) a.sparse.indices.bufferView = remap(a.sparse.indices.bufferView);
+                        if (a.sparse.values) a.sparse.values.bufferView = remap(a.sparse.values.bufferView);
+                    }
+                });
+                (json.images || []).forEach(function (im) { if (im && typeof im.bufferView === 'number') im.bufferView = remap(im.bufferView); });
+            });
+        }
+
+        console.info('[GLTFPhysicsExport] Pruned ' + removedPrimCount +
+            ' empty primitive(s), ' + meshRemove.size + ' mesh(es), ' +
+            accRemove.size + ' accessor(s), ' + bvRemove.size + ' bufferView(s).');
     }
 
     // --- physics data collection (programmatic scenes) ---
