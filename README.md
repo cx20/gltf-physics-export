@@ -80,8 +80,14 @@ older `mesh.aggregate` path.
    bodies and joint anchors.
 5. **Round-trip validation** — done. The
    [`validation.html`](example/babylonjs/validation.html) page loads each
-   sample, exports it via `GLTFPhysicsExport`, and diffs the resulting
-   physics extension blocks against the source for semantic equivalence.
+   sample, exports it via `GLTFPhysicsExport`, and checks the result two
+   ways: a **round-trip** check diffs the resulting physics extension blocks
+   against the source for semantic equivalence (then re-loads the export to
+   confirm the physics bodies rebuild), and a **glTF Validator** check runs
+   the exported `.glb` through the official
+   [Khronos glTF Validator](https://github.com/KhronosGroup/glTF-Validator)
+   so the downloadable file is verified structurally valid (a row fails on
+   any validator error; warnings are listed but do not fail).
 
 ## Programmatic-export coverage & limitations
 

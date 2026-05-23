@@ -15,6 +15,7 @@
     td.status { font-weight: 600; white-space: nowrap; }
     td.status.pass { color: #1a7f37; }
     td.status.fail { color: #cf222e; }
+    td.status.warn { color: #9a6700; }
     td.status.pending { color: #6e7781; font-weight: normal; }
     tr.section th { background: #e8eef8; font-weight: 600; padding: 6px 12px; }
     pre { margin: 0; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
@@ -30,13 +31,21 @@
   <p>For each entry below, this page fetches the upstream source (<code>.glb</code> for the
      showroom samples, <code>.gltf</code> for the per-feature test suites at
      <a href="https://github.com/eoineoineoin/glTF_Physics/tree/master/tests">eoineoineoin/glTF_Physics/tests</a>),
-     runs it through <code>BABYLON.GLTFPhysicsExport</code>, and compares the resulting physics
-     extension blocks against the source for semantic equivalence (<code>KHR_implicit_shapes</code> +
-     <code>KHR_physics_rigid_bodies</code> only; geometry / materials are out of scope).</p>
+     runs it through <code>BABYLON.GLTFPhysicsExport</code>, and checks the result two ways:</p>
+  <ul style="max-width: 820px; line-height: 1.45; margin: 0 0 12px;">
+    <li><b>Round-trip</b> — compares the exported physics extension blocks against the source for
+        semantic equivalence (<code>KHR_implicit_shapes</code> + <code>KHR_physics_rigid_bodies</code>
+        only; geometry / materials are out of scope), then re-loads the export to confirm the same
+        number of physics bodies rebuild.</li>
+    <li><b>glTF Validator</b> — runs the exported <code>.glb</code> through the official
+        <a href="https://github.com/KhronosGroup/glTF-Validator">Khronos glTF Validator</a> so the
+        downloadable file is checked for structural correctness (a row fails on any validator
+        <i>error</i>; warnings are listed but do not fail).</li>
+  </ul>
   <button id="runBtn" type="button">Run validation</button>
   <canvas id="hiddenCanvas" width="1" height="1"></canvas>
   <table id="results">
-    <thead><tr><th>Sample</th><th>Status</th><th>Details</th></tr></thead>
+    <thead><tr><th>Sample</th><th>Round-trip</th><th>glTF Validator</th><th>Details</th></tr></thead>
     <tbody></tbody>
   </table>
   <script src="gltf-physics-exporter.js"></script>
