@@ -2,6 +2,24 @@ const SAMPLES_ROOT = 'https://raw.githubusercontent.com/eoineoineoin/glTF_Physic
 const TESTS_ROOT = 'https://raw.githubusercontent.com/eoineoineoin/glTF_Physics/master/tests/';
 const HAVOK_WASM_URL = 'https://cx20.github.io/gltf-test/libs/babylonjs/dev/HavokPhysics.wasm';
 const RIGID_BODY_LOADER_URL = 'https://cx20.github.io/gltf-test/libs/babylonjs/dev/babylon-gltf-rigid-body-loader.js';
+// Official Khronos glTF Validator (Dart->JS), loaded as a browser ESM bundle.
+const GLTF_VALIDATOR_URL = 'https://cdn.jsdelivr.net/npm/gltf-validator@2.0.0-dev.3.10/+esm';
+
+// Validator warnings that are inherited from the upstream sample assets and
+// that a physics round-trip cannot fix, so we mute them to keep the dashboard
+// focused on actionable issues. Verified by validating the upstream .glb files
+// directly — they emit the exact same warnings, and our export adds none:
+//   MESH_PRIMITIVE_GENERATED_TANGENT_SPACE — a normalTexture material whose
+//     primitive ships no TANGENT attribute (Blender exported the samples this
+//     way; Babylon does not regenerate tangents). Runtime-generated tangents.
+//   IMAGE_FEATURES_UNSUPPORTED — an embedded texture carries an ICC profile /
+//     non-square pixels / animation; the source image bytes are passed through.
+// Errors are never ignored; remove a code here if a future change could
+// legitimately introduce it.
+const IGNORED_VALIDATOR_ISSUES = [
+    'MESH_PRIMITIVE_GENERATED_TANGENT_SPACE',
+    'IMAGE_FEATURES_UNSUPPORTED'
+];
 
 // Existing "showroom" samples — one .glb per top-level demo page.
 const SAMPLES = [
@@ -70,6 +88,33 @@ function registerPhysicsExtensions() {
     physicsExtensionsRegistered = true;
 }
 
+// Lazily import the glTF Validator's browser ESM bundle once. Returns its
+// validateBytes(Uint8Array, options) -> Promise<report>.
+let validatorPromise;
+function ensureGltfValidator() {
+    if (!validatorPromise) {
+        validatorPromise = import(GLTF_VALIDATOR_URL).then(function (mod) {
+            if (!mod || typeof mod.validateBytes !== 'function') {
+                throw new Error('gltf-validator module has no validateBytes export');
+            }
+            return mod.validateBytes;
+        });
+    }
+    return validatorPromise;
+}
+
+// Validate an exported GLB ArrayBuffer with the official glTF Validator.
+// GLB is self-contained (geometry/textures live in the BIN chunk), so no
+// externalResourceFunction is needed.
+async function validateGltfBytes(outBuffer) {
+    const validateBytes = await ensureGltfValidator();
+    return validateBytes(new Uint8Array(outBuffer), {
+        uri: 'export.glb',
+        maxIssues: 0,
+        ignoredIssues: IGNORED_VALIDATOR_ISSUES
+    });
+}
+
 const tbody = document.querySelector('#results tbody');
 const rowFor = new Map();
 
@@ -77,7 +122,7 @@ function appendSectionHeader(title) {
     const tr = document.createElement('tr');
     tr.className = 'section';
     const th = document.createElement('th');
-    th.colSpan = 3;
+    th.colSpan = 4;
     th.textContent = title;
     tr.appendChild(th);
     tbody.appendChild(tr);
@@ -90,12 +135,16 @@ function appendRow(entry) {
     const tdStatus = document.createElement('td');
     tdStatus.className = 'status pending';
     tdStatus.textContent = 'pending';
+    const tdValidator = document.createElement('td');
+    tdValidator.className = 'status pending';
+    tdValidator.textContent = 'pending';
     const tdDetails = document.createElement('td');
     tr.appendChild(tdName);
     tr.appendChild(tdStatus);
+    tr.appendChild(tdValidator);
     tr.appendChild(tdDetails);
     tbody.appendChild(tr);
-    rowFor.set(entry.name, { status: tdStatus, details: tdDetails });
+    rowFor.set(entry.name, { status: tdStatus, validator: tdValidator, details: tdDetails });
 }
 
 // Render: showroom samples first, then test groups (each with a header row).
@@ -112,21 +161,27 @@ function setStatus(name, cls, text) {
     row.status.textContent = text;
 }
 
-function setDetails(name, diffs, errorMessage) {
+function setValidatorStatus(name, cls, text) {
+    const row = rowFor.get(name);
+    row.validator.className = 'status ' + cls;
+    row.validator.textContent = text;
+}
+
+// Render the Details cell from a list of plain-text lines (round-trip diffs
+// and/or validator messages). Pass an empty/omitted list to clear.
+function setDetailLines(name, lines) {
     const row = rowFor.get(name);
     row.details.innerHTML = '';
-    if (errorMessage) {
-        const pre = document.createElement('pre');
-        pre.textContent = errorMessage;
-        row.details.appendChild(pre);
-        return;
-    }
-    if (!diffs || diffs.length === 0) return;
+    if (!lines || lines.length === 0) return;
     const pre = document.createElement('pre');
-    pre.textContent = diffs.map(function (d) {
-        return d.path + (d.reason ? '  —  ' + d.reason : '');
-    }).join('\n');
+    pre.textContent = lines.join('\n');
     row.details.appendChild(pre);
+}
+
+function diffsToLines(diffs) {
+    return (diffs || []).map(function (d) {
+        return d.path + (d.reason ? '  —  ' + d.reason : '');
+    });
 }
 
 // Count nodes that actually carry a Havok physics body in a scene.
@@ -148,10 +203,8 @@ function countPhysicsBodies(scene) {
 // source against a re-injected clone of itself, so it can't catch a glb
 // that fails to rebuild physics on load (e.g. a collider whose shape the
 // loader can't reconstruct). This re-load actually exercises the output.
-async function reloadBodyCheck(sourceScene, engine) {
+async function reloadBodyCheck(sourceScene, engine, outBuffer) {
     const sourceCount = countPhysicsBodies(sourceScene);
-    // Export the user-facing format (src-node tags stripped).
-    const outBuffer = await BABYLON.GLTFPhysicsExport.GLBAsync(sourceScene, 'reload-check', { download: false });
     const reScene = new BABYLON.Scene(engine);
     try {
         reScene.enablePhysics(new BABYLON.Vector3(0, -9.8, 0), new BABYLON.HavokPlugin());
@@ -179,31 +232,75 @@ async function runOne(entry, engine) {
         const result = await BABYLON.GLTFPhysicsExport.validateRoundTripAsync(scene, entry.url);
         const diffs = (result.diffs || []).slice();
 
-        // Re-load the exported glb and verify physics bodies are rebuilt.
-        let reload = null;
+        // Export the user-facing format once (src-node tags stripped); reused
+        // by both the reload check and the glTF Validator schema check.
+        let outBuffer = null;
         try {
-            reload = await reloadBodyCheck(scene, engine);
-            if (reload.sourceCount !== reload.reloadedCount) {
-                diffs.push({
-                    path: 'reload',
-                    reason: 'physics bodies ' + reload.sourceCount + ' (source) vs '
-                        + reload.reloadedCount + ' (reloaded export)'
-                });
-            }
+            outBuffer = await BABYLON.GLTFPhysicsExport.GLBAsync(scene, entry.name, { download: false });
         } catch (err) {
-            diffs.push({ path: 'reload', reason: 'export failed to re-load: ' + (err && err.message ? err.message : String(err)) });
+            diffs.push({ path: 'export', reason: 'export failed: ' + errText(err) });
+        }
+
+        // Re-load the exported glb and verify physics bodies are rebuilt.
+        if (outBuffer) {
+            try {
+                const reload = await reloadBodyCheck(scene, engine, outBuffer);
+                if (reload.sourceCount !== reload.reloadedCount) {
+                    diffs.push({
+                        path: 'reload',
+                        reason: 'physics bodies ' + reload.sourceCount + ' (source) vs '
+                            + reload.reloadedCount + ' (reloaded export)'
+                    });
+                }
+            } catch (err) {
+                diffs.push({ path: 'reload', reason: 'export failed to re-load: ' + errText(err) });
+            }
+        }
+
+        // glTF Validator schema check on the exported .glb.
+        const validatorLines = [];
+        if (outBuffer) {
+            try {
+                const report = await validateGltfBytes(outBuffer);
+                const issues = report.issues || {};
+                const numErrors = issues.numErrors || 0;
+                const numWarnings = issues.numWarnings || 0;
+                (issues.messages || []).forEach(function (m) {
+                    if (m.severity > 1) return; // skip info (2) / hint (3)
+                    validatorLines.push((m.severity === 0 ? 'ERROR ' : 'WARN  ') + m.code
+                        + (m.pointer ? ' @ ' + m.pointer : '') + ' — ' + m.message);
+                });
+                // The validator column is independent of the round-trip column:
+                // a model can round-trip physics perfectly yet be schema-invalid
+                // (and vice-versa), so a schema error is reported here only.
+                if (numErrors > 0) {
+                    setValidatorStatus(entry.name, 'fail', numErrors + ' error' + (numErrors > 1 ? 's' : ''));
+                } else if (numWarnings > 0) {
+                    setValidatorStatus(entry.name, 'warn', 'valid · ' + numWarnings + ' warn');
+                } else {
+                    setValidatorStatus(entry.name, 'pass', 'valid');
+                }
+            } catch (err) {
+                setValidatorStatus(entry.name, 'pending', 'validator n/a');
+                validatorLines.push('gltf-validator unavailable: ' + errText(err));
+            }
+        } else {
+            setValidatorStatus(entry.name, 'pending', 'skipped');
         }
 
         if (diffs.length === 0) {
             setStatus(entry.name, 'pass', 'PASS');
-            setDetails(entry.name, null);
         } else {
             setStatus(entry.name, 'fail', 'FAIL (' + diffs.length + ')');
-            setDetails(entry.name, diffs);
         }
+        setDetailLines(entry.name, diffsToLines(diffs).concat(validatorLines));
     } finally {
         scene.dispose();
     }
+}
+
+function errText(err) {
+    return err && err.message ? err.message : String(err);
 }
 
 document.getElementById('runBtn').addEventListener('click', async function () {
@@ -225,13 +322,14 @@ document.getElementById('runBtn').addEventListener('click', async function () {
             const all = SAMPLES.concat(TESTS);
             for (const entry of all) {
                 setStatus(entry.name, 'pending', 'running...');
-                setDetails(entry.name, null);
+                setValidatorStatus(entry.name, 'pending', '...');
+                setDetailLines(entry.name, null);
                 try {
                     await runOne(entry, engine);
                 } catch (err) {
                     console.error(entry.name, err);
                     setStatus(entry.name, 'fail', 'ERROR');
-                    setDetails(entry.name, null, err && err.message ? err.message : String(err));
+                    setDetailLines(entry.name, [errText(err)]);
                 }
             }
         } finally {

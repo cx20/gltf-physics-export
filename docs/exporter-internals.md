@@ -251,7 +251,7 @@ What the GLB spec requires:
 
 [`validation.html`](../example/babylonjs/validation.html) /
 [`validation.js`](../example/babylonjs/validation.js) round-trip-check every
-sample plus the upstream tests. There are **two layers** of checking.
+sample plus the upstream tests. There are **three layers** of checking.
 
 ### 4.1 JSON diff (`validateRoundTripAsync`)
 
@@ -287,6 +287,36 @@ So a **stronger check** was added on the validation.js side:
 
 Because it actually runs the output through the loader, it catches colliders
 whose shape can't be rebuilt — the safety net for what the JSON diff misses.
+
+### 4.3 Schema validation (the official glTF Validator)
+
+The first two layers only judge *physics*. They say nothing about whether the
+`.glb` is a structurally valid glTF asset — a file can round-trip physics
+perfectly and still violate the core schema. (This is exactly how the empty
+`"custom"`-mesh bug slipped through: the export had a primitive with a
+count-0 index accessor backed by a 0-length bufferView — both invalid per the
+schema — yet physics round-tripped fine and both checks above passed.)
+
+So a third layer runs the exported `.glb` through the **official Khronos glTF
+Validator**, loaded in-browser as an ESM bundle
+(`https://cdn.jsdelivr.net/npm/gltf-validator/+esm`, exposing
+`validateBytes`). The exported GLB is self-contained (geometry/textures live
+in the BIN chunk), so no `externalResourceFunction` is needed. The validation
+page shows the result in its own **glTF Validator** column, independent of the
+round-trip column: a row fails on any validator *error*; *warnings* are listed
+but do not fail. This is what now guards against re-introducing
+schema-invalid geometry. (The fix for that specific bug is `pruneEmptyGeometry`
+in `GLBAsync`, run right after `parseGLB` and before injection.)
+
+Two warning codes are muted via `ignoredIssues` (`IGNORED_VALIDATOR_ISSUES` in
+`validation.js`): `MESH_PRIMITIVE_GENERATED_TANGENT_SPACE` (a `normalTexture`
+material whose primitive ships no `TANGENT`; the samples were exported from
+Blender without tangents and Babylon does not regenerate them) and
+`IMAGE_FEATURES_UNSUPPORTED` (an embedded texture carrying an ICC profile /
+non-square pixels). Validating the upstream `.glb`s directly emits the *exact
+same* warnings — they are source-asset properties a physics round-trip cannot
+fix, and the export introduces no new ones — so muting them keeps the dashboard
+focused on actionable issues. Errors are never ignored.
 
 ---
 
