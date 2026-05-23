@@ -5,6 +5,22 @@ const RIGID_BODY_LOADER_URL = 'https://cx20.github.io/gltf-test/libs/babylonjs/d
 // Official Khronos glTF Validator (Dart->JS), loaded as a browser ESM bundle.
 const GLTF_VALIDATOR_URL = 'https://cdn.jsdelivr.net/npm/gltf-validator@2.0.0-dev.3.10/+esm';
 
+// Validator warnings that are inherited from the upstream sample assets and
+// that a physics round-trip cannot fix, so we mute them to keep the dashboard
+// focused on actionable issues. Verified by validating the upstream .glb files
+// directly — they emit the exact same warnings, and our export adds none:
+//   MESH_PRIMITIVE_GENERATED_TANGENT_SPACE — a normalTexture material whose
+//     primitive ships no TANGENT attribute (Blender exported the samples this
+//     way; Babylon does not regenerate tangents). Runtime-generated tangents.
+//   IMAGE_FEATURES_UNSUPPORTED — an embedded texture carries an ICC profile /
+//     non-square pixels / animation; the source image bytes are passed through.
+// Errors are never ignored; remove a code here if a future change could
+// legitimately introduce it.
+const IGNORED_VALIDATOR_ISSUES = [
+    'MESH_PRIMITIVE_GENERATED_TANGENT_SPACE',
+    'IMAGE_FEATURES_UNSUPPORTED'
+];
+
 // Existing "showroom" samples — one .glb per top-level demo page.
 const SAMPLES = [
     { name: 'ShapeTypes',           url: SAMPLES_ROOT + 'ShapeTypes/ShapeTypes.glb' },
@@ -92,7 +108,11 @@ function ensureGltfValidator() {
 // externalResourceFunction is needed.
 async function validateGltfBytes(outBuffer) {
     const validateBytes = await ensureGltfValidator();
-    return validateBytes(new Uint8Array(outBuffer), { uri: 'export.glb', maxIssues: 0 });
+    return validateBytes(new Uint8Array(outBuffer), {
+        uri: 'export.glb',
+        maxIssues: 0,
+        ignoredIssues: IGNORED_VALIDATOR_ISSUES
+    });
 }
 
 const tbody = document.querySelector('#results tbody');

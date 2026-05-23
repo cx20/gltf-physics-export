@@ -40,7 +40,10 @@
     <li><b>glTF Validator</b> — runs the exported <code>.glb</code> through the official
         <a href="https://github.com/KhronosGroup/glTF-Validator">Khronos glTF Validator</a> so the
         downloadable file is checked for structural correctness (a row fails on any validator
-        <i>error</i>; warnings are listed but do not fail).</li>
+        <i>error</i>; remaining warnings are listed but do not fail). A couple of advisories
+        inherited from the upstream assets — runtime-generated tangents and image color-profile
+        metadata — are muted, since they are present in the source and a physics round-trip cannot
+        fix them.</li>
   </ul>
   <button id="runBtn" type="button">Run validation</button>
   <canvas id="hiddenCanvas" width="1" height="1"></canvas>

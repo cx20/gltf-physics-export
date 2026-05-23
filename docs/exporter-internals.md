@@ -308,6 +308,16 @@ but do not fail. This is what now guards against re-introducing
 schema-invalid geometry. (The fix for that specific bug is `pruneEmptyGeometry`
 in `GLBAsync`, run right after `parseGLB` and before injection.)
 
+Two warning codes are muted via `ignoredIssues` (`IGNORED_VALIDATOR_ISSUES` in
+`validation.js`): `MESH_PRIMITIVE_GENERATED_TANGENT_SPACE` (a `normalTexture`
+material whose primitive ships no `TANGENT`; the samples were exported from
+Blender without tangents and Babylon does not regenerate them) and
+`IMAGE_FEATURES_UNSUPPORTED` (an embedded texture carrying an ICC profile /
+non-square pixels). Validating the upstream `.glb`s directly emits the *exact
+same* warnings — they are source-asset properties a physics round-trip cannot
+fix, and the export introduces no new ones — so muting them keeps the dashboard
+focused on actionable issues. Errors are never ignored.
+
 ---
 
 ## 5. Programmatic (PhysicsAggregate) scenes
